@@ -1,0 +1,30 @@
+# ps3recomp configuration for LEGO Marvel Super Heroes (USA) — BLUS-31161
+# Platform target: Android ARM64 (aarch64-linux-android, Vulkan + AAudio + NativeActivity)
+
+[game]
+title = "LEGO Marvel Super Heroes"
+title_id = "BLUS31161"
+version = "01.00"
+sdk_version = "04.4600"
+# Point to your legally obtained decrypted EBOOT.ELF (e.g., dumped via RPCS3)
+elf_path = "/storage/emulated/0/PS3/BLUS31161/PS3_GAME/USRDIR/EBOOT.ELF"
+iso_path = "/storage/emulated/0/LEGO Marvel Super Heroes (USA) (EnFrEsPt)/LEGO Marvel Super Heroes (USA) (En,Fr,Es,Pt).iso"
+vfs_root = "/storage/emulated/0/PS3/BLUS31161"
+
+[recompiler]
+output_dir = "recompiled"
+spu_dir = "spu"
+functions_per_file = 250
+enable_hle_stubs = true
+enable_spu = true
+
+[android]
+package_name = "com.ps3recomp.legomarvel"
+abi = "arm64-v8a"
+min_sdk = 26
+target_sdk = 34
+rsx_backend = "vulkan"
+vk_guest_programs = true
+vk_direct_present = true
+audio_backend = "aaudio"
+fiber_backend = "aarch64"

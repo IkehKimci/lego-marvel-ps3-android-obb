@@ -1,0 +1,33 @@
+# Build outputs & binaries
+build/
+build-*/
+dist/
+gamedata/
+*.o
+*.a
+*.so
+*.apk
+*.aab
+*.obb
+*.keystore
+*.jks
+*.log
+__pycache__/
+*.pyc
+
+# Game disc / lifted artifacts (must be provided from your own legal copy)
+lego_marvel_android/recompiled/
+lego_marvel_android/analysis/
+lego_marvel_android/spu/
+lego_marvel_android/spu_images/
+lego_marvel_android/assets/
+*.ELF
+*.elf
+*.BIN
+*.bin
+*.DAT
+*.dat
+*.ISO
+*.iso
+*.SFO
+*.TRP
