@@ -252,9 +252,10 @@ static u32 audio_backend_queued_samples(void)
 #if AUDIO_BACKEND_AAUDIO
 
 /* Lock-free single-producer / single-consumer stereo float ring buffer.
- * Power-of-two capacity: 8192 stereo frames (~170.7 ms at 48 kHz, 32 PS3 blocks). */
-#define AAUDIO_RING_FRAMES 8192u
+ * Power-of-two capacity: 16384 stereo frames (~341.3 ms at 48 kHz, 64 PS3 blocks). */
+#define AAUDIO_RING_FRAMES 16384u
 #define AAUDIO_RING_MASK   (AAUDIO_RING_FRAMES - 1u)
+#define AAUDIO_PREFILL_FRAMES (CELL_AUDIO_BLOCK_SAMPLES * 8u)
 
 typedef aaudio_result_t (*pfn_AAudio_createStreamBuilder)(AAudioStreamBuilder**);
 typedef void            (*pfn_AAudioStreamBuilder_setDirection)(AAudioStreamBuilder*, aaudio_direction_t);
@@ -278,6 +279,9 @@ static pfn_AAudioStream_close       p_aa_close = NULL;
 static float         s_aa_ring[AAUDIO_RING_FRAMES * 2u];
 static volatile u32  s_aa_read_pos  = 0;
 static volatile u32  s_aa_write_pos = 0;
+static float         s_aa_last_l    = 0.0f;
+static float         s_aa_last_r    = 0.0f;
+static u32           s_aa_fade_in   = 0;
 
 static aaudio_data_callback_result_t aaudio_data_cb(
     AAudioStream* stream, void* userData, void* audioData, int32_t numFrames)
@@ -293,14 +297,41 @@ static aaudio_data_callback_result_t aaudio_data_cb(
     const u32 avail = w - r;
     const u32 take = avail < want ? avail : want;
 
+    float last_l = s_aa_last_l;
+    float last_r = s_aa_last_r;
+    u32 fade_in = s_aa_fade_in;
+
     for (u32 i = 0; i < take; i++) {
         const u32 idx = (r + i) & AAUDIO_RING_MASK;
-        out[i * 2u + 0u] = s_aa_ring[idx * 2u + 0u];
-        out[i * 2u + 1u] = s_aa_ring[idx * 2u + 1u];
+        float sl = s_aa_ring[idx * 2u + 0u];
+        float sr = s_aa_ring[idx * 2u + 1u];
+        if (fade_in > 0u) {
+            const float t = (float)(64u - fade_in) * (1.0f / 64.0f);
+            sl = last_l + (sl - last_l) * t;
+            sr = last_r + (sr - last_r) * t;
+            fade_in--;
+        }
+        out[i * 2u + 0u] = sl;
+        out[i * 2u + 1u] = sr;
+        last_l = sl;
+        last_r = sr;
     }
     if (take < want) {
-        memset(out + take * 2u, 0, (want - take) * 2u * sizeof(float));
+        /* Exponential decay instead of hard-zero step eliminates sharp clicks/pops
+         * if a heavy scene stalls the SPU audio task past the jitter cushion. */
+        for (u32 i = take; i < want; i++) {
+            last_l *= 0.960f;
+            last_r *= 0.960f;
+            out[i * 2u + 0u] = last_l;
+            out[i * 2u + 1u] = last_r;
+        }
+        if (last_l > -1e-6f && last_l < 1e-6f) last_l = 0.0f;
+        if (last_r > -1e-6f && last_r < 1e-6f) last_r = 0.0f;
+        fade_in = 64u;
     }
+    s_aa_last_l = last_l;
+    s_aa_last_r = last_r;
+    s_aa_fade_in = fade_in;
     __atomic_store_n(&s_aa_read_pos, r + take, __ATOMIC_RELEASE);
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
@@ -308,7 +339,10 @@ static aaudio_data_callback_result_t aaudio_data_cb(
 static int audio_backend_init(void)
 {
     s_aa_read_pos = 0;
-    s_aa_write_pos = 0;
+    s_aa_write_pos = AAUDIO_PREFILL_FRAMES; /* start with 42.7 ms silence cushion */
+    s_aa_last_l = 0.0f;
+    s_aa_last_r = 0.0f;
+    s_aa_fade_in = 0;
     memset(s_aa_ring, 0, sizeof(s_aa_ring));
 
     if (!s_aa_lib) {
@@ -352,7 +386,9 @@ static int audio_backend_init(void)
     set_ch(builder, 2);
     set_fmt(builder, AAUDIO_FORMAT_PCM_FLOAT);
     set_share(builder, AAUDIO_SHARING_MODE_SHARED);
-    set_perf(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    /* Balanced mode avoids tiny 2ms hardware burst callbacks that underrun/crackle
+     * under heavy CPU/GPU contention on mid-range and low-end Android devices. */
+    set_perf(builder, AAUDIO_PERFORMANCE_MODE_NONE);
     set_cb(builder, aaudio_data_cb, NULL);
 
     aaudio_result_t res = open_stream(builder, &s_aa_stream);
@@ -371,7 +407,9 @@ static int audio_backend_init(void)
         return -1;
     }
 
-    printf("[cellAudio] AAudio backend initialized (%d Hz stereo f32)\n", CELL_AUDIO_SAMPLE_RATE);
+    printf("[cellAudio] AAudio backend initialized (%d Hz stereo f32, ring=%u frames, cushion=%u ms)\n",
+           CELL_AUDIO_SAMPLE_RATE, AAUDIO_RING_FRAMES,
+           (unsigned)((AAUDIO_PREFILL_FRAMES * 1000u) / CELL_AUDIO_SAMPLE_RATE));
     return 0;
 }
 
@@ -420,7 +458,7 @@ static u32 audio_backend_queued_samples(void)
 static int audio_backend_room(void)
 {
     if (!s_aa_stream) return -1;
-    return audio_backend_queued_samples() < CELL_AUDIO_BLOCK_SAMPLES * 4u
+    return audio_backend_queued_samples() < CELL_AUDIO_BLOCK_SAMPLES * 16u
          ? (int)CELL_AUDIO_BLOCK_SAMPLES : 0;
 }
 
@@ -710,16 +748,17 @@ static void audio_mix_one_block(void)
                 left = right = ld_be_f32(&src[s]) * level;
             }
 
-            /* If 7.1, mix center and other channels into stereo */
+            /* If 7.1, mix center and surround channels into stereo with
+             * headroom normalization so loud action scenes do not hard-clip. */
             if (nch == 8) {
-                float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.707f;
-                float lfe    = ld_be_f32(&src[s * 8 + 3]) * level * 0.5f;
-                float rl     = ld_be_f32(&src[s * 8 + 4]) * level * 0.5f;
-                float rr     = ld_be_f32(&src[s * 8 + 5]) * level * 0.5f;
-                float sl     = ld_be_f32(&src[s * 8 + 6]) * level * 0.3f;
-                float sr     = ld_be_f32(&src[s * 8 + 7]) * level * 0.3f;
-                left  += center + lfe + rl + sl;
-                right += center + lfe + rr + sr;
+                float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.50f;
+                float lfe    = ld_be_f32(&src[s * 8 + 3]) * level * 0.35f;
+                float rl     = ld_be_f32(&src[s * 8 + 4]) * level * 0.38f;
+                float rr     = ld_be_f32(&src[s * 8 + 5]) * level * 0.38f;
+                float sl     = ld_be_f32(&src[s * 8 + 6]) * level * 0.28f;
+                float sr     = ld_be_f32(&src[s * 8 + 7]) * level * 0.28f;
+                left  = left  * 0.72f + center + lfe + rl + sl;
+                right = right * 0.72f + center + lfe + rr + sr;
             }
 
             s_mix_buffer[s * 2 + 0] += left;
@@ -741,10 +780,60 @@ static void audio_mix_one_block(void)
 
     mutex_unlock(&s_audio_mutex);
 
-    /* Clip to [-1.0, 1.0] */
-    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
-        if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
-        if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
+    /* Smooth C1 soft-limiter (linear up to +/-0.82, asymptotic knee to +/-0.985)
+     * plus NaN/Inf guard and guest-hole de-click smoothing. */
+    {
+        static float s_mix_prev_l = 0.0f;
+        static float s_mix_prev_r = 0.0f;
+        static int   s_mix_was_hole = 0;
+        float block_peak = 0.0f;
+
+        for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2u; i++) {
+            float x = s_mix_buffer[i];
+            if (!(x == x) || x > 1e6f || x < -1e6f) {
+                x = 0.0f;
+            } else if (x > 0.82f) {
+                const float d = x - 0.82f;
+                x = 0.82f + 0.165f * (d / (0.165f + d));
+            } else if (x < -0.82f) {
+                const float d = -x - 0.82f;
+                x = -(0.82f + 0.165f * (d / (0.165f + d)));
+            }
+            s_mix_buffer[i] = x;
+            const float ax = x < 0.0f ? -x : x;
+            if (ax > block_peak) block_peak = ax;
+        }
+
+        if (block_peak < 1e-6f) {
+            /* If the guest SPU missed this 5.33 ms block (all-zero hole right
+             * after active audio), smoothly decay the trailing sample over 64
+             * samples to eliminate digital step clicks/crackles. */
+            if (s_mix_prev_l > 1e-4f || s_mix_prev_l < -1e-4f ||
+                s_mix_prev_r > 1e-4f || s_mix_prev_r < -1e-4f) {
+                float pl = s_mix_prev_l, pr = s_mix_prev_r;
+                for (u32 s = 0; s < 64u && s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
+                    pl *= 0.92f;
+                    pr *= 0.92f;
+                    s_mix_buffer[s * 2u + 0u] = pl;
+                    s_mix_buffer[s * 2u + 1u] = pr;
+                }
+                s_mix_prev_l = 0.0f;
+                s_mix_prev_r = 0.0f;
+                s_mix_was_hole = 1;
+            }
+        } else {
+            if (s_mix_was_hole) {
+                /* 48-sample (1 ms) smooth fade-in when audio resumes after a hole. */
+                for (u32 s = 0; s < 48u && s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
+                    const float t = (float)(s + 1u) * (1.0f / 48.0f);
+                    s_mix_buffer[s * 2u + 0u] *= t;
+                    s_mix_buffer[s * 2u + 1u] *= t;
+                }
+                s_mix_was_hole = 0;
+            }
+            s_mix_prev_l = s_mix_buffer[(CELL_AUDIO_BLOCK_SAMPLES - 1u) * 2u + 0u];
+            s_mix_prev_r = s_mix_buffer[(CELL_AUDIO_BLOCK_SAMPLES - 1u) * 2u + 1u];
+        }
     }
 }
 

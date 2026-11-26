@@ -14,6 +14,7 @@ import android.os.Looper;
 import android.os.Process;
 import android.os.SystemClock;
 import android.view.Gravity;
+import android.view.InputDevice;
 import android.view.View;
 import android.view.WindowManager;
 
@@ -28,6 +29,8 @@ public class GameActivity extends NativeActivity {
     private static boolean sNativeLinked = false;
 
     private static native long nativeGetFrameStats();
+    private static native long nativeGetFrameGenStats();
+    private static native int nativeGetGamepadState();
     private static native int nativeGetRenderHeight();
     private static native long nativeGetVirtualPadState();
 
@@ -39,6 +42,7 @@ public class GameActivity extends NativeActivity {
     private final Handler fpsHandler = new Handler(Looper.getMainLooper());
     private long lastSampleNs = 0L;
     private long lastFrames = -1L;
+    private long lastFgFrames = -1L;
 
     private final Runnable fpsTick = new Runnable() {
         @Override
@@ -55,13 +59,39 @@ public class GameActivity extends NativeActivity {
             if (isFinishing() || isDestroyed() || hudOverlay == null || !showTouch) return;
             if (sNativeLinked) {
                 try {
-                    hudOverlay.updatePadState(nativeGetVirtualPadState());
+                    int gs = nativeGetGamepadState();
+                    boolean hideNow = ((gs >>> 4) & 1) != 0;
+                    hudOverlay.setTouchHidden(hideNow);
+                    if (!hideNow) {
+                        hudOverlay.updatePadState(nativeGetVirtualPadState());
+                    }
                 } catch (Throwable ignored) {
                 }
             }
             fpsHandler.postDelayed(this, 16);
         }
     };
+
+    private static int countConnectedGamepads() {
+        int count = 0;
+        try {
+            int[] ids = InputDevice.getDeviceIds();
+            if (ids != null) {
+                for (int id : ids) {
+                    InputDevice dev = InputDevice.getDevice(id);
+                    if (dev == null) continue;
+                    int src = dev.getSources();
+                    boolean isPad = (src & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
+                            || (src & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
+                    if (isPad && !dev.isVirtual()) {
+                        count++;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return count;
+    }
 
     private static class HudOverlayView extends View {
         // PS3 CELL_PAD_CTRL_* bitmask constants (match cellPad.h)
@@ -84,6 +114,7 @@ public class GameActivity extends NativeActivity {
 
         private final boolean drawTouch;
         private final boolean drawFps;
+        private boolean touchHidden = false;
 
         private final Paint ringPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -166,6 +197,13 @@ public class GameActivity extends NativeActivity {
             fpsTextPaint.setColor(Color.rgb(240, 246, 252));
             fpsTextPaint.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
             fpsTextPaint.setTextAlign(Paint.Align.LEFT);
+        }
+
+        void setTouchHidden(boolean hidden) {
+            if (this.touchHidden != hidden) {
+                this.touchHidden = hidden;
+                invalidate();
+            }
         }
 
         void updatePadState(long packed) {
@@ -323,7 +361,7 @@ public class GameActivity extends NativeActivity {
 
             float unit = Math.min(w, h);
 
-            if (drawTouch) {
+            if (drawTouch && !touchHidden) {
                 final int btns = (int) (padState & 0xFFFFL);
                 final int lx = (int) ((padState >>> 16) & 0xFFL);
                 final int ly = (int) ((padState >>> 24) & 0xFFL);
@@ -402,44 +440,63 @@ public class GameActivity extends NativeActivity {
     private void updateFpsSample() {
         if (hudOverlay == null) return;
         long packed = 0L;
+        long fgPacked = 0L;
+        int padState = 0;
         int resH = 720;
         if (sNativeLinked) {
             try {
                 packed = nativeGetFrameStats();
+                fgPacked = nativeGetFrameGenStats();
+                padState = nativeGetGamepadState();
                 int h = nativeGetRenderHeight();
                 if (h > 0) resH = h;
             } catch (Throwable ignored) {
             }
         }
         long frames = (packed >>> 32) & 0xFFFFFFFFL;
+        int fgMode = (int) (fgPacked & 0xFFL);
+        long fgFrames = (fgPacked >>> 8) & 0xFFFFFFFFL;
+        int padCount = Math.max(padState & 0xF, countConnectedGamepads());
+        String padTag = (padCount > 0) ? (padCount > 1 ? "PAD×2  •  " : "PAD  •  ") : "";
         long nowNs = SystemClock.elapsedRealtimeNanos();
 
-        if (lastSampleNs == 0L || lastFrames < 0L || frames < lastFrames) {
+        if (lastSampleNs == 0L || lastFrames < 0L || frames < lastFrames || fgFrames < lastFgFrames) {
             lastSampleNs = nowNs;
             lastFrames = frames;
-            hudOverlay.updateFps(-1f, String.format(Locale.US, "FPS: --  •  %dp", resH));
+            lastFgFrames = fgFrames;
+            hudOverlay.updateFps(-1f, String.format(Locale.US, "%sFPS: --  •  %dp", padTag, resH));
             return;
         }
 
         double dtSec = (nowNs - lastSampleNs) / 1_000_000_000.0;
         long df = frames - lastFrames;
+        long dfg = fgFrames - lastFgFrames;
         lastSampleNs = nowNs;
         lastFrames = frames;
+        lastFgFrames = fgFrames;
 
         if (frames == 0L) {
-            hudOverlay.updateFps(-1f, String.format(Locale.US, "FPS: -- (Boot)  •  %dp", resH));
+            hudOverlay.updateFps(-1f, String.format(Locale.US, "%sFPS: -- (Boot)  •  %dp", padTag, resH));
             return;
         }
 
         if (dtSec > 0.05) {
-            float fps = (float) (df / dtSec);
+            float realFps = (float) (df / dtSec);
             if (df > 0L) {
-                float ms = (float) (1000.0 * dtSec / df);
-                hudOverlay.updateFps(fps,
-                        String.format(Locale.US, "%.1f FPS  •  %.1f ms  •  %dp", fps, ms, resH));
+                if (fgMode > 0 && dfg > 0L) {
+                    float dispFps = (float) ((df + dfg) / dtSec);
+                    hudOverlay.updateFps(dispFps,
+                            String.format(Locale.US, "%s%.1f FPS (%.0f×2 FG)  •  %dp",
+                                    padTag, dispFps, realFps, resH));
+                } else {
+                    float ms = (float) (1000.0 * dtSec / df);
+                    hudOverlay.updateFps(realFps,
+                            String.format(Locale.US, "%s%.1f FPS  •  %.1f ms  •  %dp",
+                                    padTag, realFps, ms, resH));
+                }
             } else {
                 hudOverlay.updateFps(0f,
-                        String.format(Locale.US, "0.0 FPS  •  -- ms  •  %dp", resH));
+                        String.format(Locale.US, "%s0.0 FPS  •  -- ms  •  %dp", padTag, resH));
             }
         }
     }

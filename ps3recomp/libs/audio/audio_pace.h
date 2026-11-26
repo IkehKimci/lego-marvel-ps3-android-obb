@@ -22,7 +22,14 @@
 #define AUDIO_PACE_PERIOD_DENOM     3ULL
 
 /* At a deadline with this many blocks queued, skip the period: the device's
- * clock runs slower than the host's. Six blocks bound the added latency at 32 ms. */
+ * clock runs slower than the host's. On Android, SPU MultiStream DSP overlays
+ * can spike 15-38 ms during busy gameplay scenes, so keep a wider 42-85 ms
+ * jitter cushion to prevent AAudio ring underruns and crackling. */
+#ifdef __ANDROID__
+#define AUDIO_PACE_QUEUE_HI_BLOCKS  16U
+#define AUDIO_PACE_QUEUE_LO_BLOCKS  8U
+#define AUDIO_PACE_STALL_PERIODS    8U
+#else
 #define AUDIO_PACE_QUEUE_HI_BLOCKS  6U
 
 /* Before a deadline with fewer blocks queued, mix now and restart the cadence:
@@ -33,6 +40,7 @@
 /* More than this many periods late (a host stall, a debugger stop), restart the
  * cadence at now instead of mixing the backlog as a burst of guest events. */
 #define AUDIO_PACE_STALL_PERIODS    4U
+#endif
 
 typedef enum audio_pace_action {
     AUDIO_PACE_ACTION_MIX,   /* mix one block now */

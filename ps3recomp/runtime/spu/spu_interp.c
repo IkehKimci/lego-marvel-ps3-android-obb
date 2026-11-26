@@ -317,7 +317,7 @@ SPU_INLINE int spu_exec_decoded(spu_context* ctx, uint32_t pc, uint32_t insn,
     case SPU_rotqmbybi:DST = spu_rotqmbybi(A,B); break;
     case SPU_shlqbybi: DST = spu_shlqbybi(A,B); break;
     /* channels */
-    case SPU_wrch: spu_wrch(ctx, d.ch, DST); if (ch_touched) *ch_touched = 1; break;
+    case SPU_wrch: spu_wrch(ctx, d.ch, DST); if (ch_touched && d.ch == 21u) *ch_touched = 1; break;
     case SPU_rdch: DST = spu_rdch(ctx, d.ch); if (ch_touched) *ch_touched = 1; break;
     case SPU_rchcnt: DST = spu_pref_u32(spu_rchcnt(ctx, d.ch)); break;   /* count in the preferred word, rest zero (as the lifter) */
     /* hints / no-ops */

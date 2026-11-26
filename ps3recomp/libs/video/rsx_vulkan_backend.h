@@ -123,6 +123,12 @@ int  rsx_vulkan_backend_depth_bounds(void);
  * backend. */
 int  rsx_vulkan_backend_guest_programs(void);
 
+/* GPU Frame Generation (PS3RECOMP_VK_FRAME_GEN=off|blend|flow) telemetry.
+ * fg_mode returns 0=off, 1=blend (fast 2x), 2=flow (optical-flow 2x).
+ * fg_frames returns total interpolated frames presented to the swapchain. */
+int      rsx_vulkan_backend_fg_mode(void);
+unsigned rsx_vulkan_backend_fg_frames(void);
+
 #ifdef __ANDROID__
 /* Native Android window bridge (ANativeWindow*). Call before init or on
  * SurfaceHolder / NativeActivity lifecycle changes (NULL when surface lost). */

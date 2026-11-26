@@ -386,7 +386,306 @@ int rsx_vertex_fetch_many(
     if (!plan || (!refs && count) || (!out && plan->layout.stride && count))
         return 0;
     const u32 stride = plan->layout.stride;
-    for (u32 slot = 0; slot < plan->layout.count; slot++) {
+    const u32 nslots = plan->layout.count;
+
+    /* L1-resident 64-vertex tiled fast path: when every active attribute is
+     * plain per-vertex and verified in-range (99%+ of draws), precompute
+     * element IDs once per 64-vertex tile and fetch all attributes while both
+     * the guest vertex slice (~2 KB) and output tile (~5 KB) stay hot in L1D. */
+    if (count && nslots) {
+        int all_fast = 1;
+        for (u32 s = 0; s < nslots; s++) {
+            const u32 attr = plan->layout.attrs[s];
+            const rsx_vertex_fetch_attr* f = &plan->attr[attr];
+            if (!f->desc.type || !f->desc.size) continue;
+            if (!f->stable_base || !f->all_in_range ||
+                f->desc.type < RSX_VTX_TYPE_SNORM16 || f->desc.type > RSX_VTX_TYPE_UINT8 ||
+                !rsx_vertex_freq_plain(f->desc.frequency, (plan->divider_mask >> attr) & 1u)) {
+                all_fast = 0;
+                break;
+            }
+        }
+        if (all_fast) {
+            u32 el_tile[64];
+            for (u32 base_i = 0; base_i < count; base_i += 64u) {
+                const u32 tn = (count - base_i < 64u) ? (count - base_i) : 64u;
+                for (u32 j = 0; j < tn; j++)
+                    el_tile[j] = (refs[base_i + j].vertex_id + refs[base_i + j].base_index) & 0x000FFFFFu;
+                u8* tile_out = out + (size_t)base_i * stride;
+                for (u32 slot = 0; slot < nslots; slot++) {
+                    const u32 attr = plan->layout.attrs[slot];
+                    const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
+                    const u32 type = fetch->desc.type;
+                    u8* dst = tile_out + slot * 16u;
+                    if (!type || !fetch->desc.size) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                        const float32x4_t vdef = vld1q_f32(fetch->default_value);
+                        for (u32 j = 0; j < tn; j++, dst += stride) vst1q_f32((float*)dst, vdef);
+#else
+                        const float d0 = fetch->default_value[0], d1 = fetch->default_value[1];
+                        const float d2 = fetch->default_value[2], d3 = fetch->default_value[3];
+                        for (u32 j = 0; j < tn; j++, dst += stride) {
+                            float* v = (float*)dst;
+                            v[0] = d0; v[1] = d1; v[2] = d2; v[3] = d3;
+                        }
+#endif
+                        continue;
+                    }
+                    const u8* const base = fetch->stable_base;
+                    const u32 first = fetch->stable_first;
+                    const u32 fstride = fetch->stride;
+                    const u32 n = fetch->desc.size < 4 ? fetch->desc.size : 4;
+                    switch (type) {
+                    case RSX_VTX_TYPE_FLOAT:
+                        if (n == 4) {
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+#ifdef __ARM_NEON
+                                vst1q_u8(dst, vrev32q_u8(vld1q_u8(src)));
+#else
+                                float* v = (float*)dst;
+                                v[0] = rsx_compact_be_f32(src + 0); v[1] = rsx_compact_be_f32(src + 4);
+                                v[2] = rsx_compact_be_f32(src + 8); v[3] = rsx_compact_be_f32(src + 12);
+#endif
+                            }
+                        } else if (n == 3) {
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                                float* v = (float*)dst;
+                                v[0] = rsx_compact_be_f32(src + 0);
+                                v[1] = rsx_compact_be_f32(src + 4);
+                                v[2] = rsx_compact_be_f32(src + 8);
+                                v[3] = 1.0f;
+                            }
+                        } else if (n == 2) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                            const float32x2_t z1 = { 0.0f, 1.0f };
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                                float32x2_t xy = vreinterpret_f32_u8(vrev32_u8(vld1_u8(src)));
+                                vst1q_f32((float*)dst, vcombine_f32(xy, z1));
+                            }
+#else
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                                float* v = (float*)dst;
+                                v[0] = rsx_compact_be_f32(src + 0); v[1] = rsx_compact_be_f32(src + 4);
+                                v[2] = 0.0f; v[3] = 1.0f;
+                            }
+#endif
+                        } else {
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                                float* v = (float*)dst;
+                                v[0] = rsx_compact_be_f32(src); v[1] = 0.0f; v[2] = 0.0f; v[3] = 1.0f;
+                            }
+                        }
+                        break;
+                    case RSX_VTX_TYPE_HALF:
+                        if (n == 4) {
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                                float16x4_t h4 = vreinterpret_f16_u8(vrev16_u8(vld1_u8(src)));
+                                vst1q_f32((float*)dst, vcvt_f32_f16(h4));
+#else
+                                float* v = (float*)dst;
+                                v[0] = rsx_compact_be_f16(src + 0); v[1] = rsx_compact_be_f16(src + 2);
+                                v[2] = rsx_compact_be_f16(src + 4); v[3] = rsx_compact_be_f16(src + 6);
+#endif
+                            }
+                        } else if (n == 2) {
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                                u32 raw32;
+                                memcpy(&raw32, src, 4);
+                                uint64_t pk = (uint64_t)raw32 | (0x003C0000ull << 32); /* BE 0.0h, 1.0h (0x3C00 -> bytes 3C 00 -> LE 0x003C) */
+                                float16x4_t h4 = vreinterpret_f16_u8(vrev16_u8(vreinterpret_u8_u64(vdup_n_u64(pk))));
+                                vst1q_f32((float*)dst, vcvt_f32_f16(h4));
+#else
+                                float* v = (float*)dst;
+                                v[0] = rsx_compact_be_f16(src + 0); v[1] = rsx_compact_be_f16(src + 2);
+                                v[2] = 0.0f; v[3] = 1.0f;
+#endif
+                            }
+                        } else if (n == 3) {
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                                u32 lo32; u16 hi16;
+                                memcpy(&lo32, src, 4);
+                                memcpy(&hi16, src + 4, 2);
+                                uint64_t pk = (uint64_t)lo32 | ((uint64_t)hi16 << 32) | (0x003Cull << 48); /* BE 1.0h */
+                                float16x4_t h4 = vreinterpret_f16_u8(vrev16_u8(vreinterpret_u8_u64(vdup_n_u64(pk))));
+                                vst1q_f32((float*)dst, vcvt_f32_f16(h4));
+#else
+                                float* v = (float*)dst;
+                                v[0] = rsx_compact_be_f16(src + 0); v[1] = rsx_compact_be_f16(src + 2);
+                                v[2] = rsx_compact_be_f16(src + 4); v[3] = 1.0f;
+#endif
+                            }
+                        } else {
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                                float* v = (float*)dst;
+                                v[0] = rsx_compact_be_f16(src); v[1] = 0.0f; v[2] = 0.0f; v[3] = 1.0f;
+                            }
+                        }
+                        break;
+                    case RSX_VTX_TYPE_UNORM8: {
+                        const float inv255 = 1.0f / 255.0f;
+                        if (n == 4) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                            const float32x4_t vinv255 = vdupq_n_f32(inv255);
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                                u32 raw32; memcpy(&raw32, src, 4);
+                                uint16x4_t u16v = vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(raw32))));
+                                vst1q_f32((float*)dst, vmulq_f32(vcvtq_f32_u32(vmovl_u16(u16v)), vinv255));
+                            }
+#else
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                                float* v = (float*)dst;
+                                v[0] = (float)src[0] * inv255; v[1] = (float)src[1] * inv255;
+                                v[2] = (float)src[2] * inv255; v[3] = (float)src[3] * inv255;
+                            }
+#endif
+                        } else {
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                                float* v = (float*)dst;
+                                v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+                                for (u32 c = 0; c < n; c++) v[c] = (float)src[c] * inv255;
+                            }
+                        }
+                        break;
+                    }
+                    case RSX_VTX_TYPE_UINT8:
+                        if (n == 4) {
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                                u32 raw32; memcpy(&raw32, src, 4);
+                                uint16x4_t u16v = vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(raw32))));
+                                vst1q_f32((float*)dst, vcvtq_f32_u32(vmovl_u16(u16v)));
+#else
+                                float* v = (float*)dst;
+                                v[0] = (float)src[0]; v[1] = (float)src[1];
+                                v[2] = (float)src[2]; v[3] = (float)src[3];
+#endif
+                            }
+                        } else {
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                                float* v = (float*)dst;
+                                v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+                                for (u32 c = 0; c < n; c++) v[c] = (float)src[c];
+                            }
+                        }
+                        break;
+                    case RSX_VTX_TYPE_SNORM16: {
+                        const float inv32767 = 1.0f / 32767.0f;
+                        if (n == 4) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                            const float32x4_t vinv = vdupq_n_f32(inv32767);
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                                int16x4_t s16v = vreinterpret_s16_u8(vrev16_u8(vld1_u8(src)));
+                                vst1q_f32((float*)dst, vmulq_f32(vcvtq_f32_s32(vmovl_s16(s16v)), vinv));
+                            }
+#else
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                                float* v = (float*)dst;
+                                v[0] = (float)(s16)rsx_compact_be_u16(src + 0) * inv32767;
+                                v[1] = (float)(s16)rsx_compact_be_u16(src + 2) * inv32767;
+                                v[2] = (float)(s16)rsx_compact_be_u16(src + 4) * inv32767;
+                                v[3] = (float)(s16)rsx_compact_be_u16(src + 6) * inv32767;
+                            }
+#endif
+                        } else if (n == 3) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                            const float32x4_t vinv = vdupq_n_f32(inv32767);
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                                u32 lo32; u16 hi16;
+                                memcpy(&lo32, src, 4); memcpy(&hi16, src + 4, 2);
+                                uint64_t pk = (uint64_t)lo32 | ((uint64_t)hi16 << 32) | (0xFF7Full << 48); /* BE 32767 -> 1.0f */
+                                int16x4_t s16v = vreinterpret_s16_u8(vrev16_u8(vreinterpret_u8_u64(vdup_n_u64(pk))));
+                                vst1q_f32((float*)dst, vmulq_f32(vcvtq_f32_s32(vmovl_s16(s16v)), vinv));
+                            }
+#else
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                                float* v = (float*)dst;
+                                v[0] = (float)(s16)rsx_compact_be_u16(src + 0) * inv32767;
+                                v[1] = (float)(s16)rsx_compact_be_u16(src + 2) * inv32767;
+                                v[2] = (float)(s16)rsx_compact_be_u16(src + 4) * inv32767;
+                                v[3] = 1.0f;
+                            }
+#endif
+                        } else if (n == 2) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                            const float32x4_t vinv = vdupq_n_f32(inv32767);
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                                u32 raw32; memcpy(&raw32, src, 4);
+                                uint64_t pk = (uint64_t)raw32 | (0xFF7F0000ull << 32); /* BE 0, 32767 */
+                                int16x4_t s16v = vreinterpret_s16_u8(vrev16_u8(vreinterpret_u8_u64(vdup_n_u64(pk))));
+                                vst1q_f32((float*)dst, vmulq_f32(vcvtq_f32_s32(vmovl_s16(s16v)), vinv));
+                            }
+#else
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                                float* v = (float*)dst;
+                                v[0] = (float)(s16)rsx_compact_be_u16(src + 0) * inv32767;
+                                v[1] = (float)(s16)rsx_compact_be_u16(src + 2) * inv32767;
+                                v[2] = 0.0f; v[3] = 1.0f;
+                            }
+#endif
+                        } else {
+                            for (u32 j = 0; j < tn; j++, dst += stride) {
+                                const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                                float* v = (float*)dst;
+                                v[0] = (float)(s16)rsx_compact_be_u16(src) * inv32767;
+                                v[1] = 0.0f; v[2] = 0.0f; v[3] = 1.0f;
+                            }
+                        }
+                        break;
+                    }
+                    case RSX_VTX_TYPE_SINT16:
+                        for (u32 j = 0; j < tn; j++, dst += stride) {
+                            const u8* src = base + (size_t)(el_tile[j] - first) * fstride;
+                            float* v = (float*)dst;
+                            v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+                            for (u32 c = 0; c < n; c++) v[c] = (float)(s16)rsx_compact_be_u16(src + c * 2u);
+                        }
+                        break;
+                    case RSX_VTX_TYPE_CMP32: {
+                        const float inv1023 = 1.0f / 1023.0f, inv511 = 1.0f / 511.0f;
+                        for (u32 j = 0; j < tn; j++, dst += stride) {
+                            const u32 word = rsx_compact_be_u32(base + (size_t)(el_tile[j] - first) * fstride);
+                            const s32 x = ((s32)(word << 21)) >> 21;
+                            const s32 y = ((s32)(word << 10)) >> 21;
+                            const s32 z = ((s32)word) >> 22;
+                            float* v = (float*)dst;
+                            v[0] = (float)x * inv1023; v[1] = (float)y * inv1023;
+                            v[2] = (float)z * inv511;  v[3] = 1.0f;
+                        }
+                        break;
+                    }
+                    default:
+                        break;
+                    }
+                }
+            }
+            return 1;
+        }
+    }
+
+    for (u32 slot = 0; slot < nslots; slot++) {
         const u32 attr = plan->layout.attrs[slot];
         const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
         const u32 type = fetch->desc.type;

@@ -13,6 +13,7 @@ import android.os.Environment;
 import android.provider.Settings;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.InputDevice;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
@@ -84,17 +85,22 @@ public class LauncherActivity extends Activity {
     private ArrayAdapter<DriverEntry> driverAdapter;
 
     private TextView statusBadgeText;
+    private TextView gamepadStatusText;
     private TextView logStatusText;
     private Spinner  driverSpinner;
     private Spinner  resSpinner;
     private Spinner  fpsSpinner;
     private Spinner  scalingSpinner;
+    private Spinner  fgSpinner;
+    private Spinner  gamepadLayoutSpinner;
     private Switch   swTurbo;
+    private Switch   swLowEnd;
     private Switch   swGuestShaders;
     private Switch   swDirectPresent;
     private Switch   swSpuInterp;
     private Switch   swSkipFmv;
     private Switch   swTouch;
+    private Switch   swGamepadAutohide;
     private Switch   swShowFps;
     private Switch   swVerbose;
 
@@ -102,9 +108,10 @@ public class LauncherActivity extends Activity {
             "720p (1280×720) — Native PS3",
             "540p (960×540) — Performa Tinggi",
             "480p (854×480) — Ultra Performa + Scaling",
+            "360p (640×360) — Low-End Ultra Boost",
             "1080p (1920×1080) — Resolusi Tinggi"
     };
-    private final String[] resValues = { "720p", "540p", "480p", "1080p" };
+    private final String[] resValues = { "720p", "540p", "480p", "360p", "1080p" };
 
     private final String[] fpsLabels = {
             "60 FPS (Unlocked)",
@@ -120,6 +127,19 @@ public class LauncherActivity extends Activity {
             "Bilinear (Standar)"
     };
     private final String[] scalingValues = { "fsr", "cas", "integer", "linear" };
+
+    private final String[] fgLabels = {
+            "Off (Native FPS)",
+            "Optical-Flow 2× (DLSS/FSR3 Style — GPU Vulkan)",
+            "Fast Blend 2× (Ringan untuk HP Low-End)"
+    };
+    private final String[] fgValues = { "off", "flow", "blend" };
+
+    private final String[] gamepadLayoutLabels = {
+            "Standar (PS / Xbox: A=✕, B=○, X=□, Y=△)",
+            "Nintendo / Switch (Swap A↔B & X↔Y)"
+    };
+    private final String[] gamepadLayoutValues = { "standard", "nintendo" };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -388,14 +408,49 @@ public class LauncherActivity extends Activity {
         makeLabel(gfxCard, "Lossless Scaling / Upscaler (GPU Shader)");
         scalingSpinner = makeSpinner(gfxCard, darkStringAdapter(scalingLabels));
 
+        makeLabel(gfxCard, "Frame Generation (DLSS/FSR3 Optical-Flow 2×)");
+        fgSpinner = makeSpinner(gfxCard, darkStringAdapter(fgLabels));
+
+        swLowEnd = makeSwitchRow(gfxCard, "Mode Performa Low-End (HP Kentang)",
+                "Hemat RAM cache, percepat hash tekstur & mipmap ringan (stabilkan FPS)");
         swGuestShaders = makeSwitchRow(gfxCard, "Guest Shaders (HLSL → SPIR-V)",
                 "Terjemahkan shader NV4097 asli PS3 (wajib ON untuk grafis 3D)");
         swDirectPresent = makeSwitchRow(gfxCard, "Direct Vulkan Present",
                 "Blit langsung ke swapchain tanpa readback CPU (lebih cepat)");
         swShowFps = makeSwitchRow(gfxCard, "Tampilkan FPS (HUD Overlay)",
-                "Tampilkan counter FPS, waktu frame (ms), dan resolusi secara real-time");
+                "Tampilkan counter FPS, Frame Gen (×2 FG), dan status Gamepad real-time");
 
-        // Card 3: SPU, Media & Controls
+        // Card 3: Physical Gamepad (USB / Bluetooth)
+        LinearLayout padCard = makeCard(root, "Gamepad Fisik (USB / Bluetooth — P1 & P2)");
+        gamepadStatusText = new TextView(this);
+        gamepadStatusText.setTextColor(COL_MUTED);
+        gamepadStatusText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        gamepadStatusText.setTypeface(Typeface.MONOSPACE);
+        gamepadStatusText.setBackground(roundBox(Color.parseColor("#0D1117"), COL_BORDER, 8));
+        gamepadStatusText.setPadding(dp(10), dp(8), dp(10), dp(8));
+        LinearLayout.LayoutParams gslp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        gslp.bottomMargin = dp(8);
+        gamepadStatusText.setLayoutParams(gslp);
+        padCard.addView(gamepadStatusText);
+
+        Button btnScanPad = makeButton("Refresh / Cek Gamepad Terhubung", COL_BLUE, v -> {
+            refreshGamepadStatus();
+            Toast.makeText(this, "Status gamepad diperbarui", Toast.LENGTH_SHORT).show();
+        });
+        LinearLayout.LayoutParams spblp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        spblp.bottomMargin = dp(8);
+        btnScanPad.setLayoutParams(spblp);
+        padCard.addView(btnScanPad);
+
+        makeLabel(padCard, "Layout Tombol Gamepad");
+        gamepadLayoutSpinner = makeSpinner(padCard, darkStringAdapter(gamepadLayoutLabels));
+
+        swGamepadAutohide = makeSwitchRow(padCard, "Auto-Sembunyikan Tombol Sentuh",
+                "Sembunyikan tombol virtual saat gamepad dipakai (sentuh layar untuk tampilkan lagi)");
+
+        // Card 4: SPU, Media & Controls
         LinearLayout sysCard = makeCard(root, "SPU, Video & Kontrol");
         swSpuInterp = makeSwitchRow(sysCard, "SPU Interpreter Fallback",
                 "Jalankan job SPU LZ/MultiStream yang belum di-lift (wajib ON)");
@@ -513,7 +568,43 @@ public class LauncherActivity extends Activity {
         return findFallbackObbFile();
     }
 
+    private void refreshGamepadStatus() {
+        if (gamepadStatusText == null) return;
+        List<String> names = new ArrayList<>();
+        try {
+            int[] ids = InputDevice.getDeviceIds();
+            if (ids != null) {
+                for (int id : ids) {
+                    InputDevice dev = InputDevice.getDevice(id);
+                    if (dev == null || dev.isVirtual()) continue;
+                    int src = dev.getSources();
+                    boolean isPad = (src & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
+                            || (src & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
+                    if (isPad) {
+                        String n = dev.getName();
+                        names.add((n != null && !n.trim().isEmpty()) ? n.trim() : ("Gamepad #" + id));
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        if (names.isEmpty()) {
+            gamepadStatusText.setText("Status : Tidak ada gamepad fisik terdeteksi\nDukungan: PS4/PS5, Xbox, Switch Pro, Gamesir, USB/BT HID (P1 & P2)");
+            gamepadStatusText.setTextColor(COL_MUTED);
+        } else {
+            StringBuilder sb = new StringBuilder();
+            sb.append("Status : TERHUBUNG (").append(names.size()).append(" Controller)\n");
+            for (int i = 0; i < Math.min(names.size(), 2); i++) {
+                if (i > 0) sb.append("\n");
+                sb.append("P").append(i + 1).append("     : ").append(names.get(i));
+            }
+            gamepadStatusText.setText(sb.toString());
+            gamepadStatusText.setTextColor(Color.parseColor("#3FB950"));
+        }
+    }
+
     private void refreshStatus() {
+        refreshGamepadStatus();
         File activeObb = findActiveObbFile();
         boolean permOk = hasStoragePermission();
         if (activeObb != null) {
@@ -810,10 +901,19 @@ public class LauncherActivity extends Activity {
         String scaling = m.getOrDefault("scaling_mode", "fsr");
         for (int i = 0; i < scalingValues.length; i++) if (scalingValues[i].equals(scaling)) scalingSpinner.setSelection(i);
 
+        String fg = m.getOrDefault("frame_gen", "off");
+        for (int i = 0; i < fgValues.length; i++) if (fgValues[i].equals(fg)) fgSpinner.setSelection(i);
+
+        String padLayout = m.getOrDefault("gamepad_layout", "standard");
+        for (int i = 0; i < gamepadLayoutValues.length; i++)
+            if (gamepadLayoutValues[i].equals(padLayout)) gamepadLayoutSpinner.setSelection(i);
+
         swTurbo.setChecked("1".equals(m.getOrDefault("adreno_turbo", "0")));
+        swLowEnd.setChecked("1".equals(m.getOrDefault("low_end_mode", "0")));
         swGuestShaders.setChecked(!"0".equals(m.getOrDefault("guest_shaders", "1")));
         swDirectPresent.setChecked(!"0".equals(m.getOrDefault("direct_present", "1")));
         swShowFps.setChecked(!"0".equals(m.getOrDefault("show_fps", "1")));
+        swGamepadAutohide.setChecked(!"0".equals(m.getOrDefault("gamepad_autohide", "1")));
         swSpuInterp.setChecked(!"0".equals(m.getOrDefault("spu_interp_fallback", "1")));
         swSkipFmv.setChecked("1".equals(m.getOrDefault("skip_fmv", "0")));
         swTouch.setChecked(!"0".equals(m.getOrDefault("touch_controls", "1")));
@@ -842,6 +942,10 @@ public class LauncherActivity extends Activity {
         sb.append("resolution=").append(resValues[resSpinner.getSelectedItemPosition()]).append("\n");
         sb.append("fps_limit=").append(fpsValues[fpsSpinner.getSelectedItemPosition()]).append("\n");
         sb.append("scaling_mode=").append(scalingValues[scalingSpinner.getSelectedItemPosition()]).append("\n");
+        sb.append("frame_gen=").append(fgValues[fgSpinner.getSelectedItemPosition()]).append("\n");
+        sb.append("low_end_mode=").append(swLowEnd.isChecked() ? "1" : "0").append("\n");
+        sb.append("gamepad_layout=").append(gamepadLayoutValues[gamepadLayoutSpinner.getSelectedItemPosition()]).append("\n");
+        sb.append("gamepad_autohide=").append(swGamepadAutohide.isChecked() ? "1" : "0").append("\n");
         sb.append("guest_shaders=").append(swGuestShaders.isChecked() ? "1" : "0").append("\n");
         sb.append("direct_present=").append(swDirectPresent.isChecked() ? "1" : "0").append("\n");
         sb.append("show_fps=").append(swShowFps.isChecked() ? "1" : "0").append("\n");
@@ -880,10 +984,14 @@ public class LauncherActivity extends Activity {
         resSpinner.setSelection(0);
         fpsSpinner.setSelection(0);
         scalingSpinner.setSelection(0);
+        fgSpinner.setSelection(0);
+        gamepadLayoutSpinner.setSelection(0);
         swTurbo.setChecked(false);
+        swLowEnd.setChecked(false);
         swGuestShaders.setChecked(true);
         swDirectPresent.setChecked(true);
         swShowFps.setChecked(true);
+        swGamepadAutohide.setChecked(true);
         swSpuInterp.setChecked(true);
         swSkipFmv.setChecked(false);
         swTouch.setChecked(true);

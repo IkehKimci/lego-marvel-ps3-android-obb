@@ -38,7 +38,7 @@ set(PS3RECOMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 
 add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk" EXCLUDE_FROM_ALL)
 if(TARGET ps3recomp_runtime)
-    target_compile_definitions(ps3recomp_runtime PRIVATE RSX_DRAW_ENGINE_TEXTURE_CACHE=2048)
+    target_compile_definitions(ps3recomp_runtime PRIVATE RSX_DRAW_ENGINE_TEXTURE_CACHE=4096)
 endif()
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)

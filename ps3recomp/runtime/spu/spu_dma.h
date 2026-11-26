@@ -306,7 +306,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
            * nothing useful and buries the real destinations in the histogram.
            * GETs from low EAs stay allowed: they only read garbage, and
            * LBP_SKIP_NULL_DMA already exists to test zeroing them instead. */
-          int malformed = (size == 0) || (size > 0x4000)
+          /* On real Cell MFC hardware, a 0-byte DMA is a legal no-op (e.g.
+           * MultiStream DSP overlays issue size=0 sentinel transfers). */
+          if (size == 0) return 0;
+          int malformed = (size > 0x4000)
                        || (size >= 16 && (size & 15))
                        || (((lsa ^ (uint32_t)ea) & 15) != 0)
                        || (mfc_is_put(cmd) && (uint32_t)ea < 0x10000u);

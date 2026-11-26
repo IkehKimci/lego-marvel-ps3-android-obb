@@ -322,6 +322,13 @@ typedef struct rsx_draw_backend {
      * Returns dst, or 0 when the backend cannot (the engine then takes a new
      * snapshot). */
     u32  (*depth_snapshot_into)(void* user, u32 depth, u32 dst);
+
+    /* Optional. Asynchronous GPU-to-GPU copy/blit between two colour targets
+     * inside the open command buffer (avoids synchronous readback + CPU copy +
+     * re-upload for NV0039 / NV3089 surface-to-surface transfers). Returns 0
+     * on success. */
+    int  (*surface_blit)(void* user, u32 src, u32 sx, u32 sy, u32 sw, u32 sh,
+                         u32 dst, u32 dx, u32 dy, u32 dw, u32 dh, int linear);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -384,6 +391,13 @@ void rsx_draw_engine_note_flip(u32 buffer_id);
  * out with the same pitch take part; anything else is left alone. */
 void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
 void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
+/* Fast path: when source is a live GPU colour surface and destination is also
+ * a live colour surface (or promotable VRAM texture target when allow_promote
+ * is nonzero), execute the transfer asynchronously on the GPU and return 1. */
+int  rsx_draw_engine_surface_blit(u32 src_loc, u32 src_off, u32 src_pitch,
+                                  u32 sw, u32 sh,
+                                  u32 dst_loc, u32 dst_off, u32 dst_pitch,
+                                  u32 dw, u32 dh, int linear, int allow_promote);
 
 /* --- test hooks ---------------------------------------------------------- */
 

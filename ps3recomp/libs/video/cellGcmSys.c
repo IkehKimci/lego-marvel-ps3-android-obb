@@ -1531,7 +1531,31 @@ static void nv3089_blit(void)
     u32 dbpp = (s_gcm2d.color_fmt == 4u /* R5G6B5 */) ? 2u
              : (s_gcm2d.color_fmt == 1u /* Y8 */)     ? 1u : 4u;
     u32 bpp = (sbpp == dbpp) ? sbpp : 4u;
-    if (bpp == 4) nv3089_engine_read(in_pitch, out_w, out_h);
+    if (bpp == 4) {
+        if (rsx_draw_engine_enabled() && cx0 == 0 && cy0 == 0 &&
+            cx1 >= out_x + out_w && cy1 >= out_y + out_h &&
+            !gcm_rect_tiled(src_local, s_nv3089.in_off, in_pitch, s_nv3089.in_sz >> 16) &&
+            !gcm_rect_tiled(dst_local, s_gcm2d.dst_offset, dst_pitch, out_y + out_h)) {
+            const u32 sx0 = (u32)(nv3089_origin(u0) >> 20), sy0 = (u32)(nv3089_origin(v0) >> 20);
+            const u32 sx1 = (u32)((nv3089_origin(u0) + (u64)(out_w - 1u) * s_nv3089.ds_dx) >> 20);
+            const u32 sy1 = (u32)((nv3089_origin(v0) + (u64)(out_h - 1u) * s_nv3089.dt_dy) >> 20);
+            if (sx1 >= sx0 && sy1 >= sy0) {
+                const u32 sloc = src_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+                const u32 dloc = dst_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+                const int lin = (s_nv3089.ds_dx != 0x100000u || s_nv3089.dt_dy != 0x100000u);
+                const int promote = (dst_local && out_x == 0 && out_y == 0 &&
+                                     out_w >= 64u && out_h >= 64u);
+                if (rsx_draw_engine_surface_blit(
+                        sloc, s_nv3089.in_off + sy0 * in_pitch + sx0 * 4u, in_pitch,
+                        sx1 - sx0 + 1u, sy1 - sy0 + 1u,
+                        dloc, s_gcm2d.dst_offset + out_y * dst_pitch + out_x * 4u, dst_pitch,
+                        out_w, out_h, lin, promote)) {
+                    return;
+                }
+            }
+        }
+        nv3089_engine_read(in_pitch, out_w, out_h);
+    }
     /* NV3089_ROWCOPY (default 1): an unscaled blit copies a row at a time.
      * The per-pixel loop pays a vm_read32 and a vm_write32 per pixel -- the
      * bounds and null-store checks, the store hooks, a reservation lookup and
@@ -1771,9 +1795,23 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
             const u32 span_in = (u32)span_in64, span_out = (u32)span_out64;
 
             if (rsx_draw_engine_enabled() && src_inc == 1u && dst_inc == 1u &&
-                cnt > 1u && pin >= 4u && len >= 4u)
+                cnt > 1u && pin >= 4u && len >= 4u) {
+                if (pout >= 4u && (len & 3u) == 0u &&
+                    !gcm_rect_tiled(src_local, s_nv0039.off_in,  pin,  cnt) &&
+                    !gcm_rect_tiled(dst_local, s_nv0039.off_out, pout, cnt)) {
+                    const u32 sloc = src_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+                    const u32 dloc = dst_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+                    const u32 wpx = len / 4u;
+                    const int promote = (dst_local && wpx >= 64u && cnt >= 64u);
+                    if (rsx_draw_engine_surface_blit(
+                            sloc, s_nv0039.off_in, pin, wpx, cnt,
+                            dloc, s_nv0039.off_out, pout, wpx, cnt, 0, promote)) {
+                        return;
+                    }
+                }
                 rsx_draw_engine_guest_read(src_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN,
                                            s_nv0039.off_in, pin, len / 4u, cnt);
+            }
 
             { static int _n = 0, cap = -1;
               if (cap < 0) { const char* e = getenv("NV0039_DBG"); cap = e ? atoi(e) : 0; }

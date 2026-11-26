@@ -108,7 +108,11 @@ struct AndroidLauncherSettings {
     int touch_controls      = 1;
     int show_fps            = 1;
     int adreno_turbo        = 0;
+    int low_end_mode        = 0;    /* 1 = aggressive low-end CPU/GPU/RAM mode */
+    int gamepad_autohide    = 1;    /* 1 = auto-hide touch overlay when physical pad active */
+    int gamepad_nintendo    = 0;    /* 1 = swap A<->B and X<->Y for Switch/Nintendo pads */
     std::string scaling_mode = "fsr";   /* "fsr", "cas", "integer", "linear" */
+    std::string frame_gen    = "off";   /* "off", "flow", "blend" */
     std::string driver_mode = "system"; /* "system" or "custom" */
     std::string driver_name = "System Vulkan (Stock)";
     std::string driver_dir;
@@ -153,7 +157,9 @@ static void load_android_settings(const char* internal_dir)
     if (!f) {
         setenv("PS3RECOMP_GCM_FLIP_PERIOD_US", "15500", 1);
         setenv("PS3RECOMP_VK_SCALING", g_settings.scaling_mode.c_str(), 1);
-        fprintf(stderr, "[settings] no settings.ini found; using defaults (720p, 60fps, fsr, system Vulkan)\n");
+        setenv("PS3RECOMP_VK_FRAME_GEN", g_settings.frame_gen.c_str(), 1);
+        unsetenv("PS3RECOMP_ENG_LOW_END");
+        fprintf(stderr, "[settings] no settings.ini found; using defaults (720p, 60fps, fsr, fg=off, system Vulkan)\n");
         return;
     }
 
@@ -167,7 +173,8 @@ static void load_android_settings(const char* internal_dir)
         std::string v = trim_ws(s.substr(eq + 1));
 
         if (k == "resolution") {
-            if (v == "480p")      { g_settings.render_width = 854;  g_settings.render_height = 480; }
+            if (v == "360p")      { g_settings.render_width = 640;  g_settings.render_height = 360; }
+            else if (v == "480p") { g_settings.render_width = 854;  g_settings.render_height = 480; }
             else if (v == "540p") { g_settings.render_width = 960;  g_settings.render_height = 540; }
             else if (v == "1080p"){ g_settings.render_width = 1920; g_settings.render_height = 1080; }
             else                  { g_settings.render_width = 1280; g_settings.render_height = 720; }
@@ -194,6 +201,15 @@ static void load_android_settings(const char* internal_dir)
         } else if (k == "scaling_mode") {
             if (v == "fsr" || v == "cas" || v == "integer" || v == "linear")
                 g_settings.scaling_mode = v;
+        } else if (k == "frame_gen") {
+            if (v == "off" || v == "flow" || v == "blend")
+                g_settings.frame_gen = v;
+        } else if (k == "low_end_mode") {
+            g_settings.low_end_mode = (v == "1") ? 1 : 0;
+        } else if (k == "gamepad_autohide") {
+            g_settings.gamepad_autohide = (v == "0") ? 0 : 1;
+        } else if (k == "gamepad_layout") {
+            g_settings.gamepad_nintendo = (v == "nintendo") ? 1 : 0;
         } else if (k == "guest_shaders") {
             setenv("PS3RECOMP_VK_GUEST_PROGRAMS", (v == "0") ? "0" : "1", 1);
         } else if (k == "direct_present") {
@@ -225,14 +241,23 @@ static void load_android_settings(const char* internal_dir)
     }
     fclose(f);
     setenv("PS3RECOMP_VK_SCALING", g_settings.scaling_mode.c_str(), 1);
+    setenv("PS3RECOMP_VK_FRAME_GEN", g_settings.frame_gen.c_str(), 1);
+    if (g_settings.low_end_mode) {
+        setenv("PS3RECOMP_ENG_LOW_END", "1", 1);
+        setenv("PS3RECOMP_ENG_FEEDBACK_PER_PASS", "1", 1);
+    } else {
+        unsetenv("PS3RECOMP_ENG_LOW_END");
+    }
 
     fprintf(stderr,
-            "[settings] loaded %s: %dx%d fps_limit=%d scaling=%s driver=%s(%s) turbo=%d touch=%d fps_hud=%d\n",
+            "[settings] loaded %s: %dx%d fps_limit=%d scaling=%s fg=%s low_end=%d driver=%s(%s) turbo=%d touch=%d pad_autohide=%d pad_nint=%d fps_hud=%d\n",
             loaded_from.c_str(), g_settings.render_width, g_settings.render_height,
-            g_settings.fps_limit, g_settings.scaling_mode.c_str(),
+            g_settings.fps_limit, g_settings.scaling_mode.c_str(), g_settings.frame_gen.c_str(),
+            g_settings.low_end_mode,
             g_settings.driver_mode.c_str(),
             g_settings.driver_name.c_str(), g_settings.adreno_turbo,
-            g_settings.touch_controls, g_settings.show_fps);
+            g_settings.touch_controls, g_settings.gamepad_autohide,
+            g_settings.gamepad_nintendo, g_settings.show_fps);
     fflush(stderr);
 }
 
@@ -308,6 +333,8 @@ extern "C" int ps3_android_quit_requested(void)
 static std::atomic<uint64_t> s_vpad_visual_state{
     (128ull << 16) | (128ull << 24) | (128ull << 32) | (128ull << 40)
 };
+static std::atomic<int> s_hw_pad_count{0};
+static std::atomic<int> s_hw_pad_active{0};
 
 #if PS3_ANDROID_APK
 extern "C" JNIEXPORT jlong JNICALL __attribute__((visibility("default")))
@@ -316,6 +343,24 @@ Java_com_ps3recomp_legomarvel_GameActivity_nativeGetFrameStats(JNIEnv*, jclass)
     const uint64_t frames = (uint64_t)(uint32_t)ppu_boot_frames_presented();
     const uint64_t draws  = (uint64_t)(uint32_t)rsx_vulkan_backend_guest_draws();
     return (jlong)((frames << 32) | draws);
+}
+
+extern "C" JNIEXPORT jlong JNICALL __attribute__((visibility("default")))
+Java_com_ps3recomp_legomarvel_GameActivity_nativeGetFrameGenStats(JNIEnv*, jclass)
+{
+    const uint64_t fg_frames = (uint64_t)(uint32_t)rsx_vulkan_backend_fg_frames();
+    const uint64_t fg_mode   = (uint64_t)(uint32_t)(rsx_vulkan_backend_fg_mode() & 0xFF);
+    return (jlong)((fg_frames << 8) | fg_mode);
+}
+
+extern "C" JNIEXPORT jint JNICALL __attribute__((visibility("default")))
+Java_com_ps3recomp_legomarvel_GameActivity_nativeGetGamepadState(JNIEnv*, jclass)
+{
+    const int cnt = s_hw_pad_count.load(std::memory_order_relaxed) & 0xF;
+    const int act = s_hw_pad_active.load(std::memory_order_relaxed) ? 1 : 0;
+    const int autohide = g_settings.gamepad_autohide ? 1 : 0;
+    const int hide_now = (act && autohide) ? 1 : 0;
+    return (jint)(cnt | (hide_now << 4) | (autohide << 5) | (act << 6));
 }
 
 extern "C" JNIEXPORT jint JNICALL __attribute__((visibility("default")))
@@ -1109,9 +1154,33 @@ static bool file_exists(const std::string& p)
 }
 
 /* ---------------------------------------------------------------------------
- * Android AInputQueue -> cellPad bridge (hardware gamepad + touch overlay)
+ * Android AInputQueue -> cellPad bridge (USB/BT Gamepad P1+P2 + Touch Overlay)
+ *
+ * Keeps hardware gamepad inputs (digital keys, D-Pad hat axes, analog triggers,
+ * left/right sticks) in separate non-destructive layers from the virtual touch
+ * overlay so touching the screen never clears gamepad state and vice versa.
+ * Supports up to 2 simultaneous physical controllers (local 2P co-op), DualShock/
+ * DualSense, Xbox, Switch Pro / Nintendo layout, Gamesir, and generic HID pads.
  * -------------------------------------------------------------------------*/
 static ANativeWindow* s_cur_window = nullptr;
+
+static constexpr int kMaxHwPads = 2;
+struct AndroidPadPortState {
+    int32_t dev_id        = -1;
+    u16     hw_key_btns   = 0;
+    u16     hw_hat_btns   = 0;
+    u16     hw_trig_btns  = 0;
+    u8      hw_lx = 128, hw_ly = 128, hw_rx = 128, hw_ry = 128;
+    u8      hw_l2 = 0,   hw_r2 = 0;
+
+    u16     touch_btns    = 0;
+    u8      touch_lx = 128, touch_ly = 128, touch_rx = 128, touch_ry = 128;
+    u8      touch_l2 = 0,   touch_r2 = 0;
+    bool    touch_l_active = false;
+    bool    touch_r_active = false;
+};
+
+static AndroidPadPortState s_pad_ports[kMaxHwPads];
 
 static u8 axis_to_u8_raw(float v)
 {
@@ -1124,19 +1193,96 @@ static u8 axis_to_u8_raw(float v)
     return (u8)out;
 }
 
-static u8 axis_to_u8(float v)
+static void eval_hw_stick(float x, float y, u8* out_x, u8* out_y)
 {
-    if (fabsf(v) < 0.12f) v = 0.0f;
-    return axis_to_u8_raw(v);
+    const float dz = 0.08f;
+    float len = sqrtf(x * x + y * y);
+    if (len <= dz) {
+        *out_x = 128;
+        *out_y = 128;
+        return;
+    }
+    float ux = x / len;
+    float uy = y / len;
+    float mag = (len - dz) / (1.0f - dz);
+    if (mag > 1.0f) mag = 1.0f;
+    *out_x = axis_to_u8_raw(ux * mag);
+    *out_y = axis_to_u8_raw(uy * mag);
 }
 
-static u16 android_keycode_to_ps3(int32_t kc)
+static inline float clamp01(float v)
 {
+    if (v < 0.0f) return 0.0f;
+    if (v > 1.0f) return 1.0f;
+    return v;
+}
+
+static int resolve_hw_pad_port(int32_t dev_id)
+{
+    if (dev_id <= 0) return 0;
+    for (int i = 0; i < kMaxHwPads; i++) {
+        if (s_pad_ports[i].dev_id == dev_id) return i;
+    }
+    for (int i = 0; i < kMaxHwPads; i++) {
+        if (s_pad_ports[i].dev_id < 0) {
+            s_pad_ports[i].dev_id = dev_id;
+            cellPad_android_set_connected((u32)i, 1);
+            int cnt = 0;
+            for (int k = 0; k < kMaxHwPads; k++)
+                if (s_pad_ports[k].dev_id >= 0) cnt++;
+            s_hw_pad_count.store(cnt, std::memory_order_relaxed);
+            fprintf(stderr, "[gamepad] physical controller dev_id=%d assigned to Player %d (total=%d)\n",
+                    dev_id, i + 1, cnt);
+            return i;
+        }
+    }
+    return 0;
+}
+
+static void push_combined_pad(int port)
+{
+    if (port < 0 || port >= kMaxHwPads) return;
+    const AndroidPadPortState& p = s_pad_ports[port];
+    u16 btns = (u16)(p.hw_key_btns | p.hw_hat_btns | p.hw_trig_btns);
+    u8 lx = p.hw_lx, ly = p.hw_ly, rx = p.hw_rx, ry = p.hw_ry;
+    u8 l2 = p.hw_l2, r2 = p.hw_r2;
+
+    if (port == 0) {
+        btns |= p.touch_btns;
+        if (p.touch_l_active) { lx = p.touch_lx; ly = p.touch_ly; }
+        if (p.touch_r_active) { rx = p.touch_rx; ry = p.touch_ry; }
+        if (p.touch_l2 > l2) l2 = p.touch_l2;
+        if (p.touch_r2 > r2) r2 = p.touch_r2;
+    }
+    if ((btns & CELL_PAD_CTRL_L2) && l2 == 0) l2 = 255;
+    if ((btns & CELL_PAD_CTRL_R2) && r2 == 0) r2 = 255;
+
+    cellPad_android_set_buttons_mask((u32)port, btns);
+    cellPad_android_set_sticks((u32)port, lx, ly, rx, ry);
+    cellPad_android_set_triggers((u32)port, l2, r2);
+
+    if (port == 0) {
+        const bool l_act = p.touch_l_active || abs((int)lx - 128) > 10 || abs((int)ly - 128) > 10;
+        const bool r_act = p.touch_r_active || abs((int)rx - 128) > 10 || abs((int)ry - 128) > 10;
+        const uint64_t vis = ((uint64_t)btns)
+                           | ((uint64_t)lx << 16)
+                           | ((uint64_t)ly << 24)
+                           | ((uint64_t)rx << 32)
+                           | ((uint64_t)ry << 40)
+                           | ((uint64_t)(l_act ? 1u : 0u) << 48)
+                           | ((uint64_t)(r_act ? 1u : 0u) << 49);
+        s_vpad_visual_state.store(vis, std::memory_order_relaxed);
+    }
+}
+
+static u16 android_keycode_to_ps3(int32_t kc, int32_t src)
+{
+    const bool nint = (g_settings.gamepad_nintendo != 0);
     switch (kc) {
-    case AKEYCODE_BUTTON_A:      return CELL_PAD_CTRL_CROSS;
-    case AKEYCODE_BUTTON_B:      return CELL_PAD_CTRL_CIRCLE;
-    case AKEYCODE_BUTTON_X:      return CELL_PAD_CTRL_SQUARE;
-    case AKEYCODE_BUTTON_Y:      return CELL_PAD_CTRL_TRIANGLE;
+    case AKEYCODE_BUTTON_A:      return nint ? CELL_PAD_CTRL_CIRCLE   : CELL_PAD_CTRL_CROSS;
+    case AKEYCODE_BUTTON_B:      return nint ? CELL_PAD_CTRL_CROSS    : CELL_PAD_CTRL_CIRCLE;
+    case AKEYCODE_BUTTON_X:      return nint ? CELL_PAD_CTRL_TRIANGLE : CELL_PAD_CTRL_SQUARE;
+    case AKEYCODE_BUTTON_Y:      return nint ? CELL_PAD_CTRL_SQUARE   : CELL_PAD_CTRL_TRIANGLE;
     case AKEYCODE_BUTTON_L1:     return CELL_PAD_CTRL_L1;
     case AKEYCODE_BUTTON_R1:     return CELL_PAD_CTRL_R1;
     case AKEYCODE_BUTTON_L2:     return CELL_PAD_CTRL_L2;
@@ -1149,6 +1295,27 @@ static u16 android_keycode_to_ps3(int32_t kc)
     case AKEYCODE_DPAD_DOWN:     return CELL_PAD_CTRL_DOWN;
     case AKEYCODE_DPAD_LEFT:     return CELL_PAD_CTRL_LEFT;
     case AKEYCODE_DPAD_RIGHT:    return CELL_PAD_CTRL_RIGHT;
+    case AKEYCODE_DPAD_CENTER:   return CELL_PAD_CTRL_CROSS;
+    /* Generic USB/BT HID gamepad fallback (DirectInput / PlayStation numbering) */
+    case AKEYCODE_BUTTON_1:      return CELL_PAD_CTRL_SQUARE;
+    case AKEYCODE_BUTTON_2:      return CELL_PAD_CTRL_CROSS;
+    case AKEYCODE_BUTTON_3:      return CELL_PAD_CTRL_CIRCLE;
+    case AKEYCODE_BUTTON_4:      return CELL_PAD_CTRL_TRIANGLE;
+    case AKEYCODE_BUTTON_5:      return CELL_PAD_CTRL_L1;
+    case AKEYCODE_BUTTON_6:      return CELL_PAD_CTRL_R1;
+    case AKEYCODE_BUTTON_7:      return CELL_PAD_CTRL_L2;
+    case AKEYCODE_BUTTON_8:      return CELL_PAD_CTRL_R2;
+    case AKEYCODE_BUTTON_9:      return CELL_PAD_CTRL_SELECT;
+    case AKEYCODE_BUTTON_10:     return CELL_PAD_CTRL_START;
+    case AKEYCODE_BUTTON_11:     return CELL_PAD_CTRL_L3;
+    case AKEYCODE_BUTTON_12:     return CELL_PAD_CTRL_R3;
+    /* Many Bluetooth pads send BACK for Circle/B — map it in-game instead of closing app */
+    case AKEYCODE_BACK:
+        if ((src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD ||
+            (src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK) {
+            return nint ? CELL_PAD_CTRL_CROSS : CELL_PAD_CTRL_CIRCLE;
+        }
+        return 0;
     default:                     return 0;
     }
 }
@@ -1194,6 +1361,11 @@ static void eval_stick(float x, float y, float cx, float cy, float range, u8* ou
 
 static void handle_touch_motion(const AInputEvent* ev)
 {
+    /* Touching the screen brings back the virtual touch overlay if auto-hidden. */
+    if (s_hw_pad_active.load(std::memory_order_relaxed)) {
+        s_hw_pad_active.store(0, std::memory_order_relaxed);
+    }
+
     float w = (float)(s_cur_window ? ANativeWindow_getWidth(s_cur_window) : 1280);
     float h = (float)(s_cur_window ? ANativeWindow_getHeight(s_cur_window) : 720);
     if (w <= 0.0f) w = 1280.0f;
@@ -1320,18 +1492,17 @@ static void handle_touch_motion(const AInputEvent* ev)
     if (!left_seen)  s_left_stick_pid  = -1;
     if (!right_seen) s_right_stick_pid = -1;
 
-    cellPad_android_set_buttons_mask(0, btns);
-    cellPad_android_set_sticks(0, lx, ly, rx, ry);
-    cellPad_android_set_triggers(0, l2, r2);
-
-    const uint64_t vis = ((uint64_t)btns)
-                       | ((uint64_t)lx << 16)
-                       | ((uint64_t)ly << 24)
-                       | ((uint64_t)rx << 32)
-                       | ((uint64_t)ry << 40)
-                       | ((uint64_t)(left_seen  ? 1u : 0u) << 48)
-                       | ((uint64_t)(right_seen ? 1u : 0u) << 49);
-    s_vpad_visual_state.store(vis, std::memory_order_relaxed);
+    AndroidPadPortState& p0 = s_pad_ports[0];
+    p0.touch_btns     = btns;
+    p0.touch_lx       = lx;
+    p0.touch_ly       = ly;
+    p0.touch_rx       = rx;
+    p0.touch_ry       = ry;
+    p0.touch_l2       = l2;
+    p0.touch_r2       = r2;
+    p0.touch_l_active = left_seen;
+    p0.touch_r_active = right_seen;
+    push_combined_pad(0);
 }
 
 static int on_input_queue_cb(int fd, int events, void* data)
@@ -1344,31 +1515,75 @@ static int on_input_queue_cb(int fd, int events, void* data)
         int32_t handled = 0;
         int32_t type = AInputEvent_getType(ev);
         int32_t src  = AInputEvent_getSource(ev);
+        int32_t dev  = AInputEvent_getDeviceId(ev);
 
         if (type == AINPUT_EVENT_TYPE_KEY) {
             int32_t kc = AKeyEvent_getKeyCode(ev);
-            u16 mask = android_keycode_to_ps3(kc);
-            if (mask) {
-                int down = (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_DOWN);
-                cellPad_android_set_button(0, mask, down);
+            if (kc == AKEYCODE_BUTTON_MODE) {
+                /* Swallow PS/Xbox Home button so it doesn't leak unhandled events */
                 handled = 1;
+            } else {
+                u16 mask = android_keycode_to_ps3(kc, src);
+                if (mask) {
+                    const int action = AKeyEvent_getAction(ev);
+                    const int down = (action == AKEY_EVENT_ACTION_DOWN);
+                    const int port = resolve_hw_pad_port(dev);
+                    AndroidPadPortState& p = s_pad_ports[port];
+                    if (down) p.hw_key_btns |= mask;
+                    else      p.hw_key_btns &= (u16)~mask;
+                    s_hw_pad_active.store(1, std::memory_order_relaxed);
+                    push_combined_pad(port);
+                    handled = 1;
+                }
             }
         } else if (type == AINPUT_EVENT_TYPE_MOTION) {
-            if ((src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK) {
-                u8 lx = axis_to_u8(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_X, 0));
-                u8 ly = axis_to_u8(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_Y, 0));
-                u8 rx = axis_to_u8(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_Z, 0));
-                u8 ry = axis_to_u8(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_RZ, 0));
-                float lt = AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_LTRIGGER, 0);
-                float rt = AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_RTRIGGER, 0);
+            if ((src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK ||
+                (src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD) {
+                const int port = resolve_hw_pad_port(dev);
+                AndroidPadPortState& p = s_pad_ports[port];
+
+                float fx = AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_X, 0);
+                float fy = AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_Y, 0);
+                float fz = AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_Z, 0);
+                float frz = AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_RZ, 0);
+                /* Fallback for controllers reporting right stick on RX/RY */
+                float frx = AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_RX, 0);
+                float fry = AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_RY, 0);
+                if (fabsf(fz) < 0.04f && fabsf(frz) < 0.04f &&
+                    (fabsf(frx) > 0.08f || fabsf(fry) > 0.08f)) {
+                    fz = frx;
+                    frz = fry;
+                }
+
+                float lt = fmaxf(clamp01(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_LTRIGGER, 0)),
+                                 clamp01(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_BRAKE, 0)));
+                float rt = fmaxf(clamp01(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_RTRIGGER, 0)),
+                                 clamp01(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_GAS, 0)));
                 float hx = AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_HAT_X, 0);
                 float hy = AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_HAT_Y, 0);
-                cellPad_android_set_sticks(0, lx, ly, rx, ry);
-                cellPad_android_set_triggers(0, (u8)(lt * 255.0f), (u8)(rt * 255.0f));
-                cellPad_android_set_button(0, CELL_PAD_CTRL_LEFT,  hx < -0.5f);
-                cellPad_android_set_button(0, CELL_PAD_CTRL_RIGHT, hx >  0.5f);
-                cellPad_android_set_button(0, CELL_PAD_CTRL_UP,    hy < -0.5f);
-                cellPad_android_set_button(0, CELL_PAD_CTRL_DOWN,  hy >  0.5f);
+
+                eval_hw_stick(fx, fy, &p.hw_lx, &p.hw_ly);
+                eval_hw_stick(fz, frz, &p.hw_rx, &p.hw_ry);
+                p.hw_l2 = (u8)lroundf(lt * 255.0f);
+                p.hw_r2 = (u8)lroundf(rt * 255.0f);
+
+                u16 trig_btns = 0;
+                if (lt > 0.25f) trig_btns |= CELL_PAD_CTRL_L2;
+                if (rt > 0.25f) trig_btns |= CELL_PAD_CTRL_R2;
+                p.hw_trig_btns = trig_btns;
+
+                u16 hat_btns = 0;
+                if (hx < -0.45f) hat_btns |= CELL_PAD_CTRL_LEFT;
+                if (hx >  0.45f) hat_btns |= CELL_PAD_CTRL_RIGHT;
+                if (hy < -0.45f) hat_btns |= CELL_PAD_CTRL_UP;
+                if (hy >  0.45f) hat_btns |= CELL_PAD_CTRL_DOWN;
+                p.hw_hat_btns = hat_btns;
+
+                if (fabsf(fx) > 0.12f || fabsf(fy) > 0.12f || fabsf(fz) > 0.12f || fabsf(frz) > 0.12f ||
+                    lt > 0.15f || rt > 0.15f || hat_btns != 0) {
+                    s_hw_pad_active.store(1, std::memory_order_relaxed);
+                }
+                push_combined_pad(port);
                 handled = 1;
             } else if ((src & AINPUT_SOURCE_TOUCHSCREEN) == AINPUT_SOURCE_TOUCHSCREEN &&
                        g_settings.touch_controls) {
