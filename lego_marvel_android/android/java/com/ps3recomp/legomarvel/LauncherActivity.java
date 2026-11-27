@@ -136,11 +136,12 @@ public class LauncherActivity extends Activity {
 
     private final String[] scalingLabels = {
             "Lossless Scaling (FSR1 + RCAS Tajam)",
+            "SGSR (Snapdragon Super Resolution — Cepat & Tajam)",
             "CAS Sharpen (Ringan & Tajam)",
             "Integer / Nearest (Pixel Lossless)",
             "Bilinear (Standar)"
     };
-    private final String[] scalingValues = { "fsr", "cas", "integer", "linear" };
+    private final String[] scalingValues = { "fsr", "sgsr", "cas", "integer", "linear" };
 
     private final String[] fgLabels = {
             "Off (Native FPS)",

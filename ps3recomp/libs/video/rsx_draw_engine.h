@@ -329,6 +329,16 @@ typedef struct rsx_draw_backend {
      * on success. */
     int  (*surface_blit)(void* user, u32 src, u32 sx, u32 sy, u32 sw, u32 sh,
                          u32 dst, u32 dx, u32 dy, u32 dw, u32 dh, int linear);
+
+    /* Optional. Monotonic vertex/index cache ID for the next draw() call
+     * (0 = uncached/dynamic). A backend may keep GPU-resident VBO/IBO slices
+     * keyed on this ID and skip per-draw ring memcpy on cache hits. */
+    void (*set_vcache_id)(void* user, u64 id);
+
+    /* Nonzero when readback() / depth_readback() flush any open batched work
+     * in the same GPU submission as the copy, so the engine does not issue a
+     * separate submit_and_wait() round trip right before readback. */
+    int  readback_self_flushes;
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

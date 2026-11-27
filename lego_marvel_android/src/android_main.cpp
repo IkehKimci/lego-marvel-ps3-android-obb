@@ -206,7 +206,7 @@ static void load_android_settings(const char* internal_dir)
                 setenv("PS3RECOMP_VK_PRESENT_MODE", "mailbox", 1);
             }
         } else if (k == "scaling_mode") {
-            if (v == "fsr" || v == "cas" || v == "integer" || v == "linear")
+            if (v == "sgsr" || v == "fsr" || v == "cas" || v == "integer" || v == "linear")
                 g_settings.scaling_mode = v;
         } else if (k == "frame_gen") {
             if (v == "off" || v == "flow" || v == "blend")

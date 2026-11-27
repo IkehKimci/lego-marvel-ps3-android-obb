@@ -795,15 +795,20 @@ static int rsx_fp_decompile_internal(
     Out o = { out, out_size, 0, 1 };
     out[0] = '\0';
     int uses_pack = 0;   /* a pack or unpack opcode was decoded: the preamble gets its helpers */
-    out_puts(&o,
-        "    float4 r[48]; float4 h[48];\n"
+    const char* half_env = ps3_env_once("PS3RECOMP_FP_HALF");
+    const int use_half = (half_env && *half_env && *half_env != '0') ? 1 : 0;
+    out_puts(&o, use_half
+        ? "    float4 r[48]; RSX_HALF4 h[48];\n"
+          "    [unroll] for (int _i = 0; _i < 48; _i++) { r[_i] = (float4)0; h[_i] = (RSX_HALF4)0; }\n"
+          "    float4 cc0 = (float4)0; float4 cc1 = (float4)0;\n"
+        : "    float4 r[48]; float4 h[48];\n"
         /* Fully initialise both register files: RSX programs routinely read a
          * register lane before writing it (the hardware reads undefined), but
          * HLSL rejects use-before-init (error X4000). Zero everything. */
-        "    [unroll] for (int _i = 0; _i < 48; _i++) { r[_i] = (float4)0; h[_i] = (float4)0; }\n"
+          "    [unroll] for (int _i = 0; _i < 48; _i++) { r[_i] = (float4)0; h[_i] = (float4)0; }\n"
         /* Condition-code registers for exec_if predication / set_cond. Reset
          * to 0 (NV40 CC power-up state). Dead in non-predicated programs. */
-        "    float4 cc0 = (float4)0; float4 cc1 = (float4)0;\n");
+          "    float4 cc0 = (float4)0; float4 cc1 = (float4)0;\n");
     /* RSX_FP_DEBUG=<structural hash hex>:<n>:<reg[.swz]>: in the program
      * with that structural hash (rsx_fp_structural_hash with the FNV offset
      * basis as seed, the "fp" the engine's pipeline log and shader dump
@@ -1418,6 +1423,14 @@ static int rsx_fp_decompile_internal(
     char preamble[32768]; /* bounded room for all 16 comparison helpers */
     Out p = { preamble, sizeof(preamble), 0, 1 };
     preamble[0] = '\0';
+    if (use_half) {
+        /* Safe native FP16 RelaxedPrecision for NV40 h[48] half registers
+         * (ARMSX3-style Adreno FP16 ALU + half VGPR pressure). Shaders with
+         * bit-packing opcodes (PK/UP) stay float4 to protect raw 32-bit
+         * bitcasts through asfloat/asuint. */
+        out_puts(&p, uses_pack ? "#define RSX_HALF4 float4\n"
+                               : "#define RSX_HALF4 min16float4\n");
+    }
     out_puts(&p,
         "struct PSInput {\n"
         "    float4 position : SV_POSITION; float4 col0 : COLOR0; float4 col1 : COLOR1;\n"

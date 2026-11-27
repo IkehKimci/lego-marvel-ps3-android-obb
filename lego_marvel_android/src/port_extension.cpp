@@ -25,6 +25,7 @@ static void run_prepare(const char* elf)
     setenv("PS3RECOMP_RSX_SINGLE_PRESENT", "1", 0);
     setenv("VK_DRAW_BATCH", "1", 0);
     setenv("VK_DRAW_BATCH_MAX", "4096", 0);
+    setenv("PS3RECOMP_FP_HALF", "1", 0);
     setenv("PS3RECOMP_ENG_FEEDBACK_PER_PASS", "1", 0);
     setenv("PS3RECOMP_GCM_FLIP_PACING", "adaptive", 0);
     setenv("PS3RECOMP_GCM_PPU_PUT_KICK", "1", 0);

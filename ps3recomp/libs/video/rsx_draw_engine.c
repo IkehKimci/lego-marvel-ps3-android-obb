@@ -23,7 +23,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 #include "ps3emu/log_first.h"
+
+static u64 eng_system_ram_mb(void)
+{
+    static u64 cached_mb;
+    if (cached_mb) return cached_mb;
+#if !defined(_WIN32) && defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+    const long pages = sysconf(_SC_PHYS_PAGES);
+    const long psz   = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && psz > 0)
+        cached_mb = ((u64)pages * (u64)psz) >> 20;
+#endif
+    if (!cached_mb) cached_mb = 4096u;
+    return cached_mb;
+}
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
@@ -231,6 +248,12 @@ static struct {
     u32 cached_vol_mask;
     u32 cached_unnorm_mask;
     u32 cached_unnorm_dim[RSX_DSP_NUM_TEXTURES][3];
+    rsx_fp_shadow_desc cached_shadow[RSX_DSP_NUM_TEXTURES];
+    u32 cached_shadow_mask;
+    u8  cached_gamma_mask[RSX_DSP_NUM_TEXTURES];
+    u32 cached_gamma_units;
+    u8  cached_expand_mask[RSX_DSP_NUM_TEXTURES];
+    u32 cached_expand_units;
 
     /* Cached vertex-texture enabled mask */
     int vtex_mask_valid;
@@ -250,6 +273,19 @@ static struct {
     u64 cached_vp_key;
     int cached_vp_bb_used;
     u32 cached_vp_bb;
+
+    /* Cached active FP analysis invalidated on SET_SHADER_PROGRAM (0x08E4) / frame boundary */
+    int fp_dirty;
+    int cached_fp_valid;
+    const u8* cached_fp_uc;
+    rsx_fp_fast_info cached_fp_info;
+
+    /* 1-entry MRU pipeline cache to skip open-addressing probes on repeat draws */
+    u64 last_pipe_key;
+    u32 last_pipe_handle;
+    u8  last_pipe_fixed;
+    u16 last_pipe_tex_used;
+    u64 last_pipe_fp_hash;
 
     /* Transform-constant dirty range tracking for minimal-copy VPConst */
     int vp_const_dirty;
@@ -1222,7 +1258,8 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
     const u32 n = (skip + bytes + bpp - 1u) / bpp;
     u8* rows = eng_coherence_buffer(n * bpp * h);
     if (!rows) return;
-    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    if (!g.be->readback_self_flushes)
+        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
     g.be->readback(g.be->user, s->handle, x, y, n, h, rows, n * bpp);
     if (eng_coherence_log())
         fprintf(stderr, "[rsx engine] guest_read %u:0x%08X %ux%u <- surface 0x%08X (%u bpp) at %u,%u:"
@@ -1277,6 +1314,7 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
                 eng_nonzero_pixels(rows, w * h, 4u));
     g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
     g.surfaces[slot].feedback_pass = 0;   /* a shared own-target copy no longer shows the target */
+    g.fp_dirty = 1;
 }
 
 int rsx_draw_engine_surface_blit(u32 src_loc, u32 src_off, u32 src_pitch,
@@ -1992,7 +2030,8 @@ static int eng_zdepth_to_guest(u32 slot)
         s_depth_rows = n;
         s_depth_cap = w * h;
     }
-    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    if (!g.be->readback_self_flushes)
+        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
     if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, s_depth_rows,
                              w * (u32)sizeof(float)) != 0)
         return 0;
@@ -2162,10 +2201,23 @@ static void eng_tex_masks_ensure(void)
     if (g.tex_masks_valid) return;
     const int have_3d = (g.be && g.be->texture_create_3d && g.be->texture_upload_3d) ? 1 : 0;
     u32 cube = 0, vol = 0, unnorm = 0;
+    u32 shadow_m = 0, gamma_u = 0, expand_u = 0;
+    memset(g.cached_shadow, 0, sizeof g.cached_shadow);
+    memset(g.cached_gamma_mask, 0, sizeof g.cached_gamma_mask);
+    memset(g.cached_expand_mask, 0, sizeof g.cached_expand_mask);
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
         rsx_dsp_texture t;
         eng_get_texture(u, &t);
         g.cached_unnorm_dim[u][0] = g.cached_unnorm_dim[u][1] = g.cached_unnorm_dim[u][2] = 0;
+        rsx_fp_shadow_desc_from_texture(&g.cached_shadow[u], t.format, t.dimension,
+            t.cubemap, t.mipmaps, t.filter, t.wrap, t.control0);
+        if (g.cached_shadow[u].enabled) shadow_m |= 1u << u;
+        if (t.enabled) {
+            const u8 gm = rsx_texture_gamma_mask(t.format, t.remap, t.filter, t.wrap);
+            if (gm) { g.cached_gamma_mask[u] = gm; gamma_u |= 1u << u; }
+            const u8 em = rsx_texture_expand_mask(t.format, t.remap, t.filter, t.wrap);
+            if (em) { g.cached_expand_mask[u] = em; expand_u |= 1u << u; }
+        }
         if (!t.enabled || !t.width || !t.height) continue;
         if (t.cubemap && t.width == t.height) cube |= 1u << u;
         if (have_3d && !t.cubemap && t.dimension == 3 && t.depth > 1) vol |= 1u << u;
@@ -2179,6 +2231,9 @@ static void eng_tex_masks_ensure(void)
     g.cached_cube_mask = cube;
     g.cached_vol_mask = vol;
     g.cached_unnorm_mask = unnorm;
+    g.cached_shadow_mask = shadow_m;
+    g.cached_gamma_units = gamma_u;
+    g.cached_expand_units = expand_u;
     g.tex_masks_valid = 1;
 }
 
@@ -2373,7 +2428,6 @@ static void eng_resolve_programs(eng_prog_ctx* out)
 {
     memset(out, 0, sizeof(*out));
     out->fixed = 1;
-    g.fp_constants.count = 0;
 
     if (g.vp_dirty || !g.cached_vp_valid) {
         g.cached_vp_valid = 0;
@@ -2402,25 +2456,41 @@ static void eng_resolve_programs(eng_prog_ctx* out)
             }
         }
     }
-    if (!g.cached_vp_valid || !rsx_dsp_reg(&g.rsx, 0x08E4)) return;
-
-    u32 fp_loc = 0;
-    const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
-    const u8* fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, 16);
-    if (!fp_uc) return;
-    const int fp_tiled = eng_tiled(fp_loc, fp_off, ENG_FP_MAX_BYTES);
-    if (fp_tiled) {
-        fp_uc = eng_fetch_detiled(fp_loc, fp_off, ENG_FP_MAX_BYTES);
-        if (!fp_uc) return;
-    }
-
-    if (!eng_fp_memo_scan(fp_uc, !fp_tiled, &out->fp_info, &g.fp_constants)) {
+    if (!g.cached_vp_valid || !rsx_dsp_reg(&g.rsx, 0x08E4)) {
         g.fp_constants.count = 0;
         return;
     }
-    if (!fp_tiled) {
-        fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, out->fp_info.size);
-        if (!fp_uc) { g.fp_constants.count = 0; return; }
+
+    if (g.fp_dirty || !g.cached_fp_valid) {
+        g.cached_fp_valid = 0;
+        g.fp_dirty = 0;
+        g.fp_constants.count = 0;
+        u32 fp_loc = 0;
+        const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
+        const u8* fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, 16);
+        if (!fp_uc) return;
+        const int fp_tiled = eng_tiled(fp_loc, fp_off, ENG_FP_MAX_BYTES);
+        if (fp_tiled) {
+            fp_uc = eng_fetch_detiled(fp_loc, fp_off, ENG_FP_MAX_BYTES);
+            if (!fp_uc) return;
+        }
+        rsx_fp_fast_info info;
+        if (!eng_fp_memo_scan(fp_uc, !fp_tiled, &info, &g.fp_constants)) {
+            g.fp_constants.count = 0;
+            return;
+        }
+        if (!fp_tiled) {
+            fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, info.size);
+            if (!fp_uc) { g.fp_constants.count = 0; return; }
+        }
+        g.cached_fp_uc = fp_uc;
+        g.cached_fp_info = info;
+        g.cached_fp_valid = !fp_tiled; /* detiled scratch buffer is transient */
+        out->fp_uc = fp_uc;
+        out->fp_info = info;
+    } else {
+        out->fp_uc = g.cached_fp_uc;
+        out->fp_info = g.cached_fp_info;
     }
 
     out->fixed = 0;
@@ -2430,7 +2500,6 @@ static void eng_resolve_programs(eng_prog_ctx* out)
     out->vp_key = g.cached_vp_key;
     out->vp_branch_bits_used = g.cached_vp_bb_used;
     out->vp_branch_bits = g.cached_vp_bb;
-    out->fp_uc = fp_uc;
 }
 
 /* The layout the active vertex program actually reads. An uncertain analysis
@@ -2787,9 +2856,10 @@ static u32 eng_pipeline_get(const eng_prog_ctx* prog,
     const u32 srgb_output = !fixed && rsx_fp_srgb_output_enabled(
         rsx_dsp_reg(&g.rsx, 0x1FECu), fp_ctrl,
         rsx_dsp_reg(&g.rsx, 0x0208u) & 0x1Fu);
+    eng_tex_masks_ensure();
     const u32 sampled_units = fixed ? 0u : prog->fp_info.sampled_units;
-    const u32 cube_mask = fixed ? 0u : (eng_cube_mask() & sampled_units);
-    const u32 vol_mask  = fixed ? 0u : (eng_volume_mask() & sampled_units);
+    const u32 cube_mask = fixed ? 0u : (g.cached_cube_mask & sampled_units);
+    const u32 vol_mask  = fixed ? 0u : (g.cached_vol_mask  & sampled_units);
     const u32 vtex_mask = eng_vtex_mask();
     /* BRB/CLB outcomes are baked into the program: the branch bits are
      * identity only for a program that tests them. */
@@ -2797,53 +2867,45 @@ static u32 eng_pipeline_get(const eng_prog_ctx* prog,
     const u32 ucp = fixed ? 0 : eng_user_clip_key();
     const u32 dbz = fixed ? 0 : s_dbz.unit;   /* eng_depth_bounds_prepare: unit + 1 */
 
-    rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES] = {{0}};
-    u32 shadow_mask = 0;
-    for (u32 m = sampled_units; m; m &= m - 1u) {
-        const u32 u = (u32)__builtin_ctz(m);
-        rsx_dsp_texture t;
-        eng_get_texture(u, &t);
-        rsx_fp_shadow_desc_from_texture(&shadow[u], t.format, t.dimension,
-            t.cubemap, t.mipmaps, t.filter, t.wrap, t.control0);
-        if (shadow[u].enabled) shadow_mask |= 1u << u;
+    const u32 shadow_mask  = g.cached_shadow_mask & sampled_units;
+    const u32 gamma_units  = fixed ? 0u : (g.cached_gamma_units  & prog->fp_info.gamma_candidates);
+    const u32 expand_units = fixed ? 0u : (g.cached_expand_units & prog->fp_info.expand_candidates);
+    const u32 unnorm_mask  = g.cached_unnorm_mask &
+        (fixed ? 0xFFFFu : sampled_units) & ~shadow_mask;
+
+    rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES];
+    if (shadow_mask) {
+        memset(shadow, 0, sizeof shadow);
+        for (u32 m = shadow_mask; m; m &= m - 1u) {
+            const u32 u = (u32)__builtin_ctz(m);
+            shadow[u] = g.cached_shadow[u];
+        }
     }
     u8 gamma_masks[RSX_DSP_NUM_TEXTURES] = {0};
-    u32 gamma_units = 0;
-    if (!fixed) {
-        for (u32 m = prog->fp_info.gamma_candidates; m; m &= m - 1u) {
+    if (gamma_units) {
+        for (u32 m = gamma_units; m; m &= m - 1u) {
             const u32 u = (u32)__builtin_ctz(m);
-            rsx_dsp_texture t; eng_get_texture(u, &t);
-            if (t.enabled) {
-                const u8 gm = rsx_texture_gamma_mask(t.format, t.remap, t.filter, t.wrap);
-                if (gm) { gamma_masks[u] = gm; gamma_units |= 1u << u; }
-            }
+            gamma_masks[u] = g.cached_gamma_mask[u];
         }
     }
-    /* Texture sign expansion: SET_TEXTURE_ADDRESS's UNSIGNED_REMAP_BIASED
-     * asks that every fetch come back re-centred to -1..1. Same rule as
-     * gamma: only units the program samples count. */
     u8 expand_masks[RSX_DSP_NUM_TEXTURES] = {0};
-    u32 expand_units = 0;
-    if (!fixed) {
-        for (u32 m = prog->fp_info.expand_candidates; m; m &= m - 1u) {
+    if (expand_units) {
+        for (u32 m = expand_units; m; m &= m - 1u) {
             const u32 u = (u32)__builtin_ctz(m);
-            rsx_dsp_texture t; eng_get_texture(u, &t);
-            if (t.enabled) {
-                const u8 em = rsx_texture_expand_mask(t.format, t.remap, t.filter, t.wrap);
-                if (em) { expand_masks[u] = em; expand_units |= 1u << u; }
-            }
+            expand_masks[u] = g.cached_expand_mask[u];
         }
     }
-
     u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][3];
-    /* Shadow helpers normalize against the bound resource themselves. Only
-     * sampled ordinary UN units need baked dimensions or cache identity. */
-    const u32 unnorm_mask = eng_unnorm_units(unnorm_dim) &
-        (fixed ? 0xFFFFu : sampled_units) & ~shadow_mask;
     if (unnorm_mask) {
-        for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++)
-            if (!(unnorm_mask & (1u << u)))
-                unnorm_dim[u][0] = unnorm_dim[u][1] = unnorm_dim[u][2] = 0;
+        memset(unnorm_dim, 0, sizeof unnorm_dim);
+        for (u32 m = unnorm_mask; m; m &= m - 1u) {
+            const u32 u = (u32)__builtin_ctz(m);
+            unnorm_dim[u][0] = g.cached_unnorm_dim[u][0];
+            unnorm_dim[u][1] = g.cached_unnorm_dim[u][1];
+            unnorm_dim[u][2] = g.cached_unnorm_dim[u][2];
+        }
+    } else {
+        memset(unnorm_dim, 0, sizeof unnorm_dim);
     }
 
     /* An antialiased target is held at its sample grid; WPOS must still count
@@ -2902,6 +2964,13 @@ static u32 eng_pipeline_get(const eng_prog_ctx* prog,
     key = eng_mix64(key, pack1);
     key = eng_mix64(key, rs_hash);
 
+    if (g.last_pipe_handle && g.last_pipe_key == key) {
+        *out_fixed = g.last_pipe_fixed;
+        *out_tex_used = g.last_pipe_tex_used;
+        *out_fp_hash = g.last_pipe_fp_hash;
+        return g.last_pipe_handle;
+    }
+
     u32 slot = eng_pipeline_slot(key);
     for (; g.pipeline_index[slot]; slot = (slot + 1u) & (ENG_PIPELINE_INDEX - 1u)) {
         const eng_pipeline* p = &g.pipelines[g.pipeline_index[slot] - 1u];
@@ -2909,6 +2978,13 @@ static u32 eng_pipeline_get(const eng_prog_ctx* prog,
             *out_fixed = p->fixed;
             *out_tex_used = p->tex_used;
             *out_fp_hash = p->fp_hash;
+            if (p->handle) {
+                g.last_pipe_key = key;
+                g.last_pipe_handle = p->handle;
+                g.last_pipe_fixed = p->fixed;
+                g.last_pipe_tex_used = p->tex_used;
+                g.last_pipe_fp_hash = p->fp_hash;
+            }
             return p->handle;
         }
     }
@@ -3256,20 +3332,25 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
  * rsx_draw_engine_write_topology_indices() on cache hits, while re-verifying a
  * fast sampled content fingerprint (~15-30 ns) on every hit so SPU-skinned or
  * dynamic vertex buffers always re-fetch cleanly without stale geometry. */
-#define ENG_VC_SETS      1024u
+#define ENG_VC_SETS      2048u
 #define ENG_VC_MAX_VERTS 32768u
 #define ENG_VC_MAX_SRCS  8u
+
+typedef struct {
+    u32 loc;
+    u32 off;
+    u32 stride;
+    u32 type_size;   /* (type << 16) | size */
+} eng_vc_attr;
 
 typedef struct {
     u32 prim, layout_mask, stride, is_idx, first, count;
     u32 base_offset, base_index, restart_en, restart_val;
     u32 ia_loc, ia_off, ia_is_u32;
     u32 n_attrs;
-    u32 attr_loc[RSX_DSP_NUM_VERTEX_ATTR];
-    u32 attr_off[RSX_DSP_NUM_VERTEX_ATTR];
-    u32 attr_stride[RSX_DSP_NUM_VERTEX_ATTR];
-    u32 attr_type[RSX_DSP_NUM_VERTEX_ATTR];
-    u32 attr_size[RSX_DSP_NUM_VERTEX_ATTR];
+    u32 def_mask;
+    u32 _pad;
+    eng_vc_attr attrs[RSX_DSP_NUM_VERTEX_ATTR];
     u32 def_vals[RSX_DSP_NUM_VERTEX_ATTR][4];
 } eng_vc_key;
 
@@ -3280,6 +3361,7 @@ typedef struct {
 } eng_vc_src;
 
 typedef struct {
+    u64        id;
     u64        key_hash;
     u64        lru;
     u8         valid;
@@ -3296,6 +3378,7 @@ typedef struct {
 
 static eng_vc_entry s_vcache[ENG_VC_SETS][2];
 static u64          s_vc_lru;
+static u64          s_vc_next_id;
 static u64          s_vc_bytes;
 static u32          s_vc_evict_cursor;
 
@@ -3306,7 +3389,11 @@ static void eng_vc_free_entry(eng_vc_entry* e)
     free(e->indices);
     if (s_vc_bytes >= e->mem_bytes) s_vc_bytes -= e->mem_bytes;
     else s_vc_bytes = 0;
-    memset(e, 0, sizeof *e);
+    e->valid = 0;
+    e->id = 0;
+    e->verts = NULL;
+    e->indices = NULL;
+    e->mem_bytes = 0;
 }
 
 static void eng_vcache_shutdown(void)
@@ -3337,7 +3424,7 @@ static u32 eng_vc_elem_bytes(u32 type, u32 size)
 static inline u64 eng_vc_fingerprint(const u8* p, u32 span)
 {
     u64 h = 1469598103934665603ull ^ ((u64)span * 0x9E3779B97F4A7C15ull);
-    if (span <= 256u) {
+    if (span <= 64u) {
         u32 i = 0;
         for (; i + 8u <= span; i += 8u) {
             u64 w;
@@ -3349,30 +3436,58 @@ static inline u64 eng_vc_fingerprint(const u8* p, u32 span)
         }
         return h;
     }
-    /* Sample 12 evenly-spaced 8-byte words covering start, interior, and end. */
+    /* Sample 8 evenly-spaced 8-byte words covering start, interior, and exact end (no integer division). */
     const u32 max_off = span - 8u;
-    for (u32 k = 0; k < 12u; k++) {
-        const u32 off = (u32)(((u64)k * max_off) / 11u);
+    const u32 step = max_off >> 3;
+    u32 off = 0u;
+    for (u32 k = 0; k < 7u; k++, off += step) {
         u64 w;
         memcpy(&w, p + off, 8);
+        h = (h ^ w) * 1099511628211ull;
+    }
+    {
+        u64 w;
+        memcpy(&w, p + max_off, 8);
         h = (h ^ w) * 1099511628211ull;
     }
     return h;
 }
 
-static u64 eng_vc_hash_key(const eng_vc_key* k)
+static inline u64 eng_vc_hash_key(const eng_vc_key* k)
 {
     const u8* p = (const u8*)k;
-    const u32 n = (u32)sizeof(*k);
+    const u32 n = (u32)(offsetof(eng_vc_key, attrs) + k->n_attrs * sizeof(eng_vc_attr));
     u64 h = 1469598103934665603ull;
-    u32 i = 0;
-    for (; i + 8u <= n; i += 8u) {
+    for (u32 i = 0; i + 8u <= n; i += 8u) {
         u64 w;
         memcpy(&w, p + i, 8);
         h = (h ^ w) * 1099511628211ull;
     }
-    for (; i < n; i++) h = (h ^ p[i]) * 1099511628211ull;
+    u32 dm = k->def_mask;
+    while (dm) {
+        const u32 s = (u32)__builtin_ctz(dm);
+        dm &= dm - 1u;
+        u64 d0, d1;
+        memcpy(&d0, &k->def_vals[s][0], 8);
+        memcpy(&d1, &k->def_vals[s][2], 8);
+        h = (h ^ d0) * 1099511628211ull;
+        h = (h ^ d1) * 1099511628211ull;
+    }
     return h;
+}
+
+static inline int eng_vc_key_eq(const eng_vc_key* a, const eng_vc_key* b)
+{
+    if (a->n_attrs != b->n_attrs || a->def_mask != b->def_mask) return 0;
+    const size_t head_n = offsetof(eng_vc_key, attrs) + a->n_attrs * sizeof(eng_vc_attr);
+    if (memcmp(a, b, head_n) != 0) return 0;
+    u32 dm = a->def_mask;
+    while (dm) {
+        const u32 s = (u32)__builtin_ctz(dm);
+        dm &= dm - 1u;
+        if (memcmp(a->def_vals[s], b->def_vals[s], 16u) != 0) return 0;
+    }
+    return 1;
 }
 
 static int eng_vcache_build_key(u32 prim, const rsx_vertex_layout_plan* layout,
@@ -3388,7 +3503,6 @@ static int eng_vcache_build_key(u32 prim, const rsx_vertex_layout_plan* layout,
     const u32 count  = is_idx ? dc.idx[0].count : dc.arr[0].count;
     if (!count || count > 131072u) return 0;
 
-    memset(out, 0, sizeof *out);
     out->prim = prim;
     out->layout_mask = layout->mask;
     out->stride = layout->stride;
@@ -3397,6 +3511,8 @@ static int eng_vcache_build_key(u32 prim, const rsx_vertex_layout_plan* layout,
     out->count = count;
     out->base_offset = rsx_dsp_vertex_data_base_offset(&g.rsx);
     out->n_attrs = layout->count;
+    out->def_mask = 0u;
+    out->_pad = 0u;
 
     if (is_idx) {
         rsx_dsp_index_array ia;
@@ -3407,6 +3523,9 @@ static int eng_vcache_build_key(u32 prim, const rsx_vertex_layout_plan* layout,
         out->ia_is_u32   = ia.is_u32;
         out->restart_en  = (u32)(rsx_dsp_restart_index_enabled(&g.rsx, ia.is_u32) != 0);
         out->restart_val = out->restart_en ? rsx_dsp_restart_index(&g.rsx) : 0u;
+    } else {
+        out->base_index = out->ia_loc = out->ia_off = out->ia_is_u32 = 0u;
+        out->restart_en = out->restart_val = 0u;
     }
 
     for (u32 s = 0; s < layout->count; s++) {
@@ -3414,15 +3533,15 @@ static int eng_vcache_build_key(u32 prim, const rsx_vertex_layout_plan* layout,
         rsx_dsp_vertex_attr va;
         rsx_dsp_get_vertex_attr(&g.rsx, attr, &va);
         if (va.frequency > 1u) return 0;
-        out->attr_loc[s]    = va.location;
-        out->attr_off[s]    = va.offset;
-        out->attr_stride[s] = va.stride;
-        out->attr_type[s]   = va.type;
-        out->attr_size[s]   = va.size;
+        out->attrs[s].loc       = va.location;
+        out->attrs[s].off       = va.offset;
+        out->attrs[s].stride    = va.stride;
+        out->attrs[s].type_size = (va.type << 16) | (va.size & 0xFFFFu);
         if (!va.size || !va.type) {
             float def[4];
             rsx_vertex_fetch_default(&g.rsx, attr, def);
             memcpy(out->def_vals[s], def, 16u);
+            out->def_mask |= 1u << s;
         }
     }
 
@@ -3436,7 +3555,7 @@ static const eng_vc_entry* eng_vcache_lookup(const eng_vc_key* key, u64 hash)
     for (u32 way = 0; way < 2u; way++) {
         eng_vc_entry* e = &s_vcache[set][way];
         if (!e->valid || e->key_hash != hash) continue;
-        if (memcmp(&e->key, key, sizeof *key) != 0) continue;
+        if (!eng_vc_key_eq(&e->key, key)) continue;
         int match = 1;
         for (u32 i = 0; i < e->n_srcs; i++) {
             if (eng_vc_fingerprint(e->srcs[i].ptr, e->srcs[i].span) != e->srcs[i].fp) {
@@ -3452,16 +3571,16 @@ static const eng_vc_entry* eng_vcache_lookup(const eng_vc_key* key, u64 hash)
     return NULL;
 }
 
-static void eng_vcache_store(const eng_vc_key* key, u64 hash,
-                             const rsx_vertex_layout_plan* layout,
-                             const u8* verts, u32 n_verts,
-                             const u32* indices, u32 n_draw, int indexed)
+static u64 eng_vcache_store(const eng_vc_key* key, u64 hash,
+                            const rsx_vertex_layout_plan* layout,
+                            const u8* verts, u32 n_verts,
+                            const u32* indices, u32 n_draw, int indexed)
 {
-    if (!verts || !n_verts || n_verts > ENG_VC_MAX_VERTS || !n_draw || !dc.n_refs) return;
+    if (!verts || !n_verts || n_verts > ENG_VC_MAX_VERTS || !n_draw || !dc.n_refs) return 0;
     const u64 vbytes = (u64)n_verts * layout->stride;
     const u64 ibytes = (indexed && indices) ? (u64)n_draw * sizeof(u32) : 0ull;
     const u64 total_bytes = vbytes + ibytes;
-    if (!total_bytes || total_bytes > (2u << 20)) return;
+    if (!total_bytes || total_bytes > (2u << 20)) return 0;
 
     u32 min_idx = 0xFFFFFFFFu, max_idx = 0u;
     for (u32 i = 0; i < dc.n_refs; i++) {
@@ -3469,7 +3588,7 @@ static void eng_vcache_store(const eng_vc_key* key, u64 hash,
         if (vi < min_idx) min_idx = vi;
         if (vi > max_idx) max_idx = vi;
     }
-    if (min_idx > max_idx) return;
+    if (min_idx > max_idx) return 0;
 
     eng_vc_src srcs[ENG_VC_MAX_SRCS];
     u32 n_srcs = 0;
@@ -3479,9 +3598,9 @@ static void eng_vcache_store(const eng_vc_key* key, u64 hash,
         const u64 start = (u64)key->ia_off + (u64)key->first * esz;
         const u64 bytes = (u64)key->count * esz;
         if (start > 0xFFFFFFFFull || bytes > 0xFFFFFFFFull || start + bytes > 0x100000000ull)
-            return;
+            return 0;
         const u8* ip = eng_guest_ptr(NULL, key->ia_loc, (u32)start, (u32)bytes);
-        if (!ip) return;
+        if (!ip) return 0;
         srcs[n_srcs].ptr  = ip;
         srcs[n_srcs].span = (u32)bytes;
         srcs[n_srcs].fp   = eng_vc_fingerprint(ip, (u32)bytes);
@@ -3489,15 +3608,17 @@ static void eng_vcache_store(const eng_vc_key* key, u64 hash,
     }
 
     for (u32 s = 0; s < key->n_attrs; s++) {
-        if (!key->attr_size[s] || !key->attr_type[s]) continue;
-        const u32 eb = eng_vc_elem_bytes(key->attr_type[s], key->attr_size[s]);
-        const u32 base0 = rsx_dsp_resolve_vertex_offset(key->base_offset, key->attr_off[s]);
-        const u64 start = (u64)base0 + (u64)min_idx * key->attr_stride[s];
-        const u64 span  = (key->attr_stride[s] ? (u64)(max_idx - min_idx) * key->attr_stride[s] : 0ull) + eb;
+        const u32 atype = key->attrs[s].type_size >> 16;
+        const u32 asize = key->attrs[s].type_size & 0xFFFFu;
+        if (!asize || !atype) continue;
+        const u32 eb = eng_vc_elem_bytes(atype, asize);
+        const u32 base0 = rsx_dsp_resolve_vertex_offset(key->base_offset, key->attrs[s].off);
+        const u64 start = (u64)base0 + (u64)min_idx * key->attrs[s].stride;
+        const u64 span  = (key->attrs[s].stride ? (u64)(max_idx - min_idx) * key->attrs[s].stride : 0ull) + eb;
         if (!span || start > 0xFFFFFFFFull || span > 0xFFFFFFFFull || start + span > 0x100000000ull)
-            return;
-        const u8* vp = eng_guest_ptr(NULL, key->attr_loc[s], (u32)start, (u32)span);
-        if (!vp) return;
+            return 0;
+        const u8* vp = eng_guest_ptr(NULL, key->attrs[s].loc, (u32)start, (u32)span);
+        if (!vp) return 0;
         const u8* vp_end = vp + span;
         int merged = 0;
         for (u32 k = 0; k < n_srcs; k++) {
@@ -3516,23 +3637,23 @@ static void eng_vcache_store(const eng_vc_key* key, u64 hash,
             }
         }
         if (!merged) {
-            if (n_srcs >= ENG_VC_MAX_SRCS) return;
+            if (n_srcs >= ENG_VC_MAX_SRCS) return 0;
             srcs[n_srcs].ptr  = vp;
             srcs[n_srcs].span = (u32)span;
             n_srcs++;
         }
     }
-    if (!n_srcs) return;
+    if (!n_srcs) return 0;
     for (u32 k = key->is_idx ? 1u : 0u; k < n_srcs; k++)
         srcs[k].fp = eng_vc_fingerprint(srcs[k].ptr, srcs[k].span);
 
     const u32 set = (u32)(hash ^ (hash >> 32)) & (ENG_VC_SETS - 1u);
     u32 victim = 0u;
     if (s_vcache[set][0].valid && s_vcache[set][0].key_hash == hash &&
-        memcmp(&s_vcache[set][0].key, key, sizeof *key) == 0) {
+        eng_vc_key_eq(&s_vcache[set][0].key, key)) {
         victim = 0u;
     } else if (s_vcache[set][1].valid && s_vcache[set][1].key_hash == hash &&
-               memcmp(&s_vcache[set][1].key, key, sizeof *key) == 0) {
+               eng_vc_key_eq(&s_vcache[set][1].key, key)) {
         victim = 1u;
     } else if (!s_vcache[set][0].valid) {
         victim = 0u;
@@ -3545,24 +3666,26 @@ static void eng_vcache_store(const eng_vc_key* key, u64 hash,
     eng_vc_entry* e = &s_vcache[set][victim];
     eng_vc_free_entry(e);
 
-    const u64 mem_cap = g.low_end ? (16ull << 20) : (32ull << 20);
-    for (u32 tries = 0; s_vc_bytes + total_bytes > mem_cap && tries < 16u; tries++) {
+    const u64 mem_cap = g.low_end ? (16ull << 20)
+                                  : (eng_system_ram_mb() >= 6000ull ? (64ull << 20) : (32ull << 20));
+    for (u32 tries = 0; s_vc_bytes + total_bytes > mem_cap && tries < 24u; tries++) {
         const u32 es = s_vc_evict_cursor++ & (ENG_VC_SETS - 1u);
         const u32 ew = (s_vcache[es][0].lru <= s_vcache[es][1].lru) ? 0u : 1u;
         eng_vc_free_entry(&s_vcache[es][ew]);
     }
-    if (s_vc_bytes + total_bytes > mem_cap) return;
+    if (s_vc_bytes + total_bytes > mem_cap) return 0;
 
     u8* vc_v = (u8*)malloc((size_t)vbytes);
-    if (!vc_v) return;
+    if (!vc_v) return 0;
     u32* vc_i = NULL;
     if (ibytes) {
         vc_i = (u32*)malloc((size_t)ibytes);
-        if (!vc_i) { free(vc_v); return; }
+        if (!vc_i) { free(vc_v); return 0; }
         memcpy(vc_i, indices, (size_t)ibytes);
     }
     memcpy(vc_v, verts, (size_t)vbytes);
 
+    e->id        = ++s_vc_next_id;
     e->key_hash  = hash;
     e->lru       = ++s_vc_lru;
     e->valid     = 1u;
@@ -3574,8 +3697,16 @@ static void eng_vcache_store(const eng_vc_key* key, u64 hash,
     e->verts     = vc_v;
     e->indices   = vc_i;
     memcpy(e->srcs, srcs, n_srcs * sizeof(eng_vc_src));
-    e->key       = *key;
+    const size_t head_n = offsetof(eng_vc_key, attrs) + key->n_attrs * sizeof(eng_vc_attr);
+    memcpy(&e->key, key, head_n);
+    u32 dm = key->def_mask;
+    while (dm) {
+        const u32 s = (u32)__builtin_ctz(dm);
+        dm &= dm - 1u;
+        memcpy(e->key.def_vals[s], key->def_vals[s], 16u);
+    }
     s_vc_bytes  += total_bytes;
+    return e->id;
 }
 
 /* ---- sink ---------------------------------------------------------------- */
@@ -4407,6 +4538,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     u32 draw_n_verts = 0;
     const u32* draw_indices = NULL;
     int vc_hit_ok = 0;
+    u64 vc_id = 0;
     eng_vc_key vc_key;
     u64 vc_hash = 0;
     const int vc_elig = eng_vcache_build_key(prim, &layout, &vc_key, &vc_hash);
@@ -4420,6 +4552,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
             draw_indices = hit->indices;
             n_draw = hit->n_draw;
             indexed = hit->indexed;
+            vc_id = hit->id;
             vc_hit_ok = 1;
         }
     }
@@ -4458,8 +4591,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
         draw_n_verts = dc.n_verts;
         draw_indices = indexed ? g.indices : NULL;
         if (vc_elig) {
-            eng_vcache_store(&vc_key, vc_hash, &layout, dc.verts, dc.n_verts,
-                             indexed ? g.indices : NULL, n_draw, indexed);
+            vc_id = eng_vcache_store(&vc_key, vc_hash, &layout, dc.verts, dc.n_verts,
+                                     indexed ? g.indices : NULL, n_draw, indexed);
         }
     }
     const u64 t_vtx1 = eng_now_ns();
@@ -4679,6 +4812,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
     }
 
     const u32 uploaded = indexed ? draw_n_verts : n_draw;
+    if (g.be->set_vcache_id)
+        g.be->set_vcache_id(g.be->user, vc_id);
     g.be->draw(g.be->user, topology, draw_verts, uploaded, layout.stride,
                indexed ? draw_indices : NULL, indexed ? n_draw : 0);
     s_eng_perf.draw_ns += eng_now_ns() - t_draw0;
@@ -4878,6 +5013,7 @@ static void eng_present(u32 buffer_id)
     }
     g.frames++;
     g.pass_serial++;    /* a frame ends every pass: no copy is shared into the next */
+    g.fp_dirty = 1;     /* re-verify inline FP constants at least once per frame */
     s_dbz_pass_key = 0;   /* a present ends the pass (eng_dbz_pass_note) */
     eng_frame_hooks();
     g.last_guest_draws = g.guest_draws;
@@ -4982,6 +5118,9 @@ int rsx_draw_engine_init(u32 width, u32 height)
     g.rs_dirty = 1;
     g.vp_dirty = 1;
     g.cached_vp_valid = 0;
+    g.fp_dirty = 1;
+    g.cached_fp_valid = 0;
+    g.last_pipe_handle = 0;
     g.vp_const_dirty = 1;
     g.vp_cb_bound_once = 0;
     g.vp_const_load = 0;
@@ -5042,6 +5181,8 @@ void rsx_draw_engine_method(u32 method, u32 arg)
     if ((m >= 0x0B80u && m < 0x0C00u) || m == 0x1E9Cu || m == 0x1EA0u ||
         m == 0x1FF0u || m == 0x1FF4u || m == 0x1FF8u) {
         g.vp_dirty = 1;
+    } else if (m == 0x08E4u) {
+        g.fp_dirty = 1;
     } else if (m == 0x1EFCu) {
         g.vp_const_load = arg;
     } else if (m >= 0x1F00u && m < 0x1F80u) {

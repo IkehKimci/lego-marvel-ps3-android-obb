@@ -1532,7 +1532,7 @@ static void nv3089_blit(void)
              : (s_gcm2d.color_fmt == 1u /* Y8 */)     ? 1u : 4u;
     u32 bpp = (sbpp == dbpp) ? sbpp : 4u;
     if (bpp == 4) {
-        if (rsx_draw_engine_enabled() && cx0 == 0 && cy0 == 0 &&
+        if (rsx_draw_engine_enabled() && cx0 <= out_x && cy0 <= out_y &&
             cx1 >= out_x + out_w && cy1 >= out_y + out_h &&
             !gcm_rect_tiled(src_local, s_nv3089.in_off, in_pitch, s_nv3089.in_sz >> 16) &&
             !gcm_rect_tiled(dst_local, s_gcm2d.dst_offset, dst_pitch, out_y + out_h)) {
