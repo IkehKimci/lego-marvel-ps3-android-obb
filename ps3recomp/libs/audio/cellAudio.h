@@ -115,6 +115,10 @@ s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice);
 /* NID: 0x28BC1409 */
 s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream);
 
+/* Lock-free 24 kHz stereo IMA-ADPCM tap for Dual-Screen / Online Co-op streaming */
+void cellAudio_coop_set_enabled(int enabled);
+u32  cellAudio_coop_read_adpcm(u8* out_buf, u32 max_bytes, u32* out_frames);
+
 #ifdef __cplusplus
 }
 #endif

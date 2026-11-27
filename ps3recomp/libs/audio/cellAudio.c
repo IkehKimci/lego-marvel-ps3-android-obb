@@ -961,6 +961,152 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     return 0;
 }
 #else
+/* ---------------------------------------------------------------------------
+ * Lock-free 24 kHz Stereo IMA-ADPCM Audio Tap for Dual-Screen / Online Co-op
+ * Zero overhead when disabled (single relaxed atomic check per mix block).
+ * -------------------------------------------------------------------------*/
+#define COOP_AUDIO_RING_FRAMES 8192u  /* ~341 ms at 24 kHz */
+#define COOP_AUDIO_RING_MASK   (COOP_AUDIO_RING_FRAMES - 1u)
+#define COOP_AUDIO_CHUNK_FRAMES 512u  /* 21.33 ms -> 8 + 512 = 520 bytes */
+
+static volatile int  s_coop_audio_enabled = 0;
+static s16           s_coop_audio_ring[COOP_AUDIO_RING_FRAMES * 2u];
+static volatile u32  s_coop_audio_rpos = 0;
+static volatile u32  s_coop_audio_wpos = 0;
+static s32           s_coop_adpcm_pred[2] = { 0, 0 };
+static s32           s_coop_adpcm_idx[2]  = { 0, 0 };
+
+static const s16 k_ima_step_table[89] = {
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31,
+    34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143,
+    157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658,
+    724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499,
+    2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630,
+    9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623,
+    27086, 29794, 32767
+};
+
+static const s8 k_ima_index_table[16] = {
+    -1, -1, -1, -1, 2, 4, 6, 8,
+    -1, -1, -1, -1, 2, 4, 6, 8
+};
+
+static inline s16 coop_f32_to_s16(float v)
+{
+    if (v >  1.0f) v =  1.0f;
+    if (v < -1.0f) v = -1.0f;
+    s32 s = (s32)(v * 32767.0f);
+    if (s >  32767) s =  32767;
+    if (s < -32768) s = -32768;
+    return (s16)s;
+}
+
+static inline u8 coop_ima_encode_sample(s16 sample, s32* pred, s32* idx)
+{
+    s32 p = *pred;
+    s32 i = *idx;
+    s32 step = k_ima_step_table[i];
+    s32 diff = (s32)sample - p;
+    u8 code = 0;
+    if (diff < 0) {
+        code = 8;
+        diff = -diff;
+    }
+    s32 delta = step >> 3;
+    if (diff >= step)       { code |= 4; diff -= step;      delta += step; }
+    if (diff >= (step >> 1)){ code |= 2; diff -= step >> 1; delta += step >> 1; }
+    if (diff >= (step >> 2)){ code |= 1;                    delta += step >> 2; }
+    if (code & 8) p -= delta;
+    else          p += delta;
+    if (p >  32767) p =  32767;
+    if (p < -32768) p = -32768;
+    i += k_ima_index_table[code];
+    if (i < 0)  i = 0;
+    if (i > 88) i = 88;
+    *pred = p;
+    *idx  = i;
+    return code;
+}
+
+static void cellAudio_coop_tap_push(const float* stereo_48k, u32 num_frames_48k)
+{
+    if (!__atomic_load_n(&s_coop_audio_enabled, __ATOMIC_RELAXED)) return;
+    if (!stereo_48k || num_frames_48k < 2u) return;
+
+    const u32 out_frames = num_frames_48k >> 1; /* 2:1 box-filtered 48kHz -> 24kHz */
+    u32 w = __atomic_load_n(&s_coop_audio_wpos, __ATOMIC_RELAXED);
+    const u32 r = __atomic_load_n(&s_coop_audio_rpos, __ATOMIC_ACQUIRE);
+    const u32 free_frames = COOP_AUDIO_RING_FRAMES - (w - r);
+    const u32 put = (out_frames < free_frames) ? out_frames : free_frames;
+
+    for (u32 i = 0; i < put; i++) {
+        const u32 si = i * 4u;
+        const float l = 0.5f * (stereo_48k[si + 0u] + stereo_48k[si + 2u]);
+        const float rch = 0.5f * (stereo_48k[si + 1u] + stereo_48k[si + 3u]);
+        const u32 di = ((w + i) & COOP_AUDIO_RING_MASK) * 2u;
+        s_coop_audio_ring[di + 0u] = coop_f32_to_s16(l);
+        s_coop_audio_ring[di + 1u] = coop_f32_to_s16(rch);
+    }
+    __atomic_store_n(&s_coop_audio_wpos, w + put, __ATOMIC_RELEASE);
+}
+
+void cellAudio_coop_set_enabled(int enabled)
+{
+    if (enabled) {
+        u32 w = __atomic_load_n(&s_coop_audio_wpos, __ATOMIC_ACQUIRE);
+        __atomic_store_n(&s_coop_audio_rpos, w, __ATOMIC_RELEASE);
+        s_coop_adpcm_pred[0] = s_coop_adpcm_pred[1] = 0;
+        s_coop_adpcm_idx[0]  = s_coop_adpcm_idx[1]  = 0;
+        __atomic_store_n(&s_coop_audio_enabled, 1, __ATOMIC_RELEASE);
+    } else {
+        __atomic_store_n(&s_coop_audio_enabled, 0, __ATOMIC_RELEASE);
+    }
+}
+
+u32 cellAudio_coop_read_adpcm(u8* out_buf, u32 max_bytes, u32* out_frames)
+{
+    if (out_frames) *out_frames = 0;
+    if (!out_buf || max_bytes < (8u + COOP_AUDIO_CHUNK_FRAMES)) return 0;
+    if (!__atomic_load_n(&s_coop_audio_enabled, __ATOMIC_ACQUIRE)) return 0;
+
+    u32 r = __atomic_load_n(&s_coop_audio_rpos, __ATOMIC_RELAXED);
+    const u32 w = __atomic_load_n(&s_coop_audio_wpos, __ATOMIC_ACQUIRE);
+    u32 avail = w - r;
+    if (avail < COOP_AUDIO_CHUNK_FRAMES) return 0;
+
+    /* If consumer fell >120 ms behind (network stall), fast-forward to freshest audio */
+    if (avail > COOP_AUDIO_CHUNK_FRAMES * 6u) {
+        r = w - COOP_AUDIO_CHUNK_FRAMES * 2u;
+    }
+
+    s32 pL = s_coop_adpcm_pred[0], iL = s_coop_adpcm_idx[0];
+    s32 pR = s_coop_adpcm_pred[1], iR = s_coop_adpcm_idx[1];
+
+    /* 8-byte block header: [s16LE predL, u8 idxL, 0, s16LE predR, u8 idxR, 0] */
+    out_buf[0] = (u8)(pL & 0xFF);
+    out_buf[1] = (u8)((pL >> 8) & 0xFF);
+    out_buf[2] = (u8)(iL & 0xFF);
+    out_buf[3] = 0;
+    out_buf[4] = (u8)(pR & 0xFF);
+    out_buf[5] = (u8)((pR >> 8) & 0xFF);
+    out_buf[6] = (u8)(iR & 0xFF);
+    out_buf[7] = 0;
+
+    for (u32 n = 0; n < COOP_AUDIO_CHUNK_FRAMES; n++) {
+        const u32 si = ((r + n) & COOP_AUDIO_RING_MASK) * 2u;
+        const u8 cL = coop_ima_encode_sample(s_coop_audio_ring[si + 0u], &pL, &iL);
+        const u8 cR = coop_ima_encode_sample(s_coop_audio_ring[si + 1u], &pR, &iR);
+        out_buf[8u + n] = (u8)((cL & 0x0Fu) | ((cR & 0x0Fu) << 4));
+    }
+
+    s_coop_adpcm_pred[0] = pL; s_coop_adpcm_idx[0] = iL;
+    s_coop_adpcm_pred[1] = pR; s_coop_adpcm_idx[1] = iR;
+    __atomic_store_n(&s_coop_audio_rpos, r + COOP_AUDIO_CHUNK_FRAMES, __ATOMIC_RELEASE);
+
+    if (out_frames) *out_frames = COOP_AUDIO_CHUNK_FRAMES;
+    return 8u + COOP_AUDIO_CHUNK_FRAMES;
+}
+
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
@@ -1017,6 +1163,7 @@ static void* audio_mix_thread_func(void* arg)
         audio_mix_one_block();
         audio_dump_mix();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+        cellAudio_coop_tap_push(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
         /* AUDIO_PEAK=1: the loudest sample of every second of mixed output (187.5 blocks of 256). */
         { static int pk_on = -1; if (pk_on < 0) pk_on = getenv("AUDIO_PEAK") ? 1 : 0;

@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: lego-marvel-coop-relay
+    runtime: node
+    region: singapore
+    plan: free
+    buildCommand: ""
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: SERVER_NAME
+        value: LEGO Marvel Co-op Online Relay (SG)
+      - key: MAX_ROOMS
+        value: "100"

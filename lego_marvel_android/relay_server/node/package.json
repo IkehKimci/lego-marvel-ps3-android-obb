@@ -1,0 +1,12 @@
+{
+  "name": "lego-marvel-coop-relay",
+  "version": "1.0.0",
+  "description": "Free Multi-Room Online Co-op Relay Server (WebSocket + Multi-Port TCP) for LEGO Marvel PS3 Android",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

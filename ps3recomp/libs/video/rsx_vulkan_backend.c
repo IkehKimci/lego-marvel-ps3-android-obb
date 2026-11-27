@@ -3143,12 +3143,14 @@ static int vk_present_direct_wanted(void)
  * to be destroyed). Safe from any thread: a slot's fence is reset only when a
  * present starts, which never runs alongside the walker. */
 static void vk_pt_wait_stages(void);
+static void vk_coop_wait_gpu(void);
 static void vk_present_wait_gpu(void)
 {
     for (u32 i = 0; i < VK_PRESENT_SLOTS; i++)
         if (__atomic_load_n(&s_vk.present_busy[i], __ATOMIC_ACQUIRE) && s_vk.present_fences[i])
             pvkWaitForFences(s_vk.device, 1, &s_vk.present_fences[i], VK_TRUE, UINT64_MAX);
     vk_pt_wait_stages();   /* a present thread's copies out of a surface */
+    vk_coop_wait_gpu();    /* async Co-op P2 copy out of a surface */
 }
 
 /* present_mu held: finish a read-back present -- wait for its copy, keep the
@@ -4118,6 +4120,559 @@ static void vk_pt_start(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Dual-Screen 2-Phone Wi-Fi Co-op (Host Split + Async 640x360 P2 Capture)
+ *
+ * When enabled on Phone 1 (Host):
+ *   - mode 0 (off)         : disabled (zero GPU/RAM/CPU overhead)
+ *   - mode 1 (auto)        : observes left-half / right-half 3D draw viewports
+ *                            & scissors each frame with hysteresis so Phone 1
+ *                            shows full screen in menus/cutscenes/close co-op
+ *                            and switches seamlessly to LEFT-HALF-ONLY fullscreen
+ *                            for Player 1 the instant vertical split activates!
+ *   - mode 2 (force_split) : always displays LEFT half on Phone 1, streams
+ *                            RIGHT half to Phone 2.
+ *   - mode 3 (mirror)      : full screen on both Phone 1 and Phone 2.
+ *
+ * Phone 2 video frames are downscaled to 640x360 asynchronously into a 2-slot
+ * host-cached readback ring with dedicated fences (NEVER blocking the RSX
+ * game thread). The Java MediaCodec H.264 encoder thread calls
+ * rsx_vulkan_backend_coop_fill_yuv() to convert straight into Image.Plane
+ * Y/U/V buffers with exact vendor row/pixel strides.
+ * -------------------------------------------------------------------------*/
+enum {
+    VK_COOP_OFF         = 0,
+    VK_COOP_AUTO        = 1,
+    VK_COOP_FORCE_SPLIT = 2,
+    VK_COOP_MIRROR      = 3,
+};
+
+enum {
+    VK_COOP_ASPECT_BALANCED = 0, /* 78% centered width (natural wide feel + full HUD) */
+    VK_COOP_ASPECT_FILL     = 1, /* 100% full width */
+    VK_COOP_ASPECT_FIT      = 2, /* exact pixel aspect ratio (pillarboxed) */
+};
+
+#define VK_COOP_W      640u
+#define VK_COOP_H      360u
+#define VK_COOP_SLOTS  2u
+
+static struct {
+    int             mode;              /* atomic */
+    int             aspect_mode;       /* atomic */
+    int             client_connected;  /* atomic */
+    int             split_active;      /* atomic */
+    int             stop_atomic;       /* atomic */
+    u32             left_draws;
+    u32             right_draws;
+    int             split_hist;
+    int             gpu_ready;
+    int             gpu_failed;
+    VkCommandPool   pool;
+    VkCommandBuffer cmd[VK_COOP_SLOTS];
+    VkFence         fence[VK_COOP_SLOTS];
+    vk_image        img;               /* 640x360 RGBA8 intermediate target */
+    int             img_fresh;
+    vk_buffer       rb[VK_COOP_SLOTS]; /* 640x360x4 host-cached readback ring */
+    int             slot_state[VK_COOP_SLOTS]; /* atomic: 0=FREE, 1=SUBMITTED */
+    int             slot_split[VK_COOP_SLOTS];
+    u64             slot_seq[VK_COOP_SLOTS];
+    u64             next_seq;
+    u32             next_slot;
+    int             active_readers;    /* atomic: encoder threads touching rb[] */
+#ifndef _WIN32
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    clockid_t       clock_id;
+    int             cv_init;
+#endif
+} s_coop = {
+    .mode = VK_COOP_OFF,
+    .aspect_mode = VK_COOP_ASPECT_BALANCED,
+#ifndef _WIN32
+    .mu = PTHREAD_MUTEX_INITIALIZER,
+#endif
+};
+
+#ifndef _WIN32
+static void vk_coop_cv_ensure_locked(void)
+{
+    if (s_coop.cv_init) return;
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    if (pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0) {
+        s_coop.clock_id = CLOCK_MONOTONIC;
+    } else {
+        s_coop.clock_id = CLOCK_REALTIME;
+    }
+    pthread_cond_init(&s_coop.cv, &attr);
+    pthread_condattr_destroy(&attr);
+    s_coop.cv_init = 1;
+}
+#endif
+
+static void vk_coop_configure(int mode, int aspect_mode)
+{
+    if (mode < VK_COOP_OFF || mode > VK_COOP_MIRROR) mode = VK_COOP_OFF;
+    if (aspect_mode < VK_COOP_ASPECT_BALANCED || aspect_mode > VK_COOP_ASPECT_FIT)
+        aspect_mode = VK_COOP_ASPECT_BALANCED;
+    __atomic_store_n(&s_coop.mode, mode, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_coop.aspect_mode, aspect_mode, __ATOMIC_RELEASE);
+    if (mode == VK_COOP_OFF || mode == VK_COOP_MIRROR)
+        __atomic_store_n(&s_coop.split_active, 0, __ATOMIC_RELEASE);
+    else if (mode == VK_COOP_FORCE_SPLIT)
+        __atomic_store_n(&s_coop.split_active, 1, __ATOMIC_RELEASE);
+    VK_LOG("Co-op Dual-Screen configured: mode=%d aspect=%d\n", mode, aspect_mode);
+}
+
+static void vk_coop_set_client_connected(int connected)
+{
+    const int v = connected ? 1 : 0;
+    __atomic_store_n(&s_coop.client_connected, v, __ATOMIC_RELEASE);
+    if (v) __atomic_store_n(&s_coop.stop_atomic, 0, __ATOMIC_RELEASE);
+#ifndef _WIN32
+    pthread_mutex_lock(&s_coop.mu);
+    vk_coop_cv_ensure_locked();
+    pthread_cond_broadcast(&s_coop.cv);
+    pthread_mutex_unlock(&s_coop.mu);
+#endif
+}
+
+static int vk_coop_get_mode(void)
+{
+    return __atomic_load_n(&s_coop.mode, __ATOMIC_ACQUIRE);
+}
+
+static int vk_coop_is_split_active(void)
+{
+    return __atomic_load_n(&s_coop.split_active, __ATOMIC_ACQUIRE);
+}
+
+static void vk_coop_observe_draw(u32 w, u32 h, const VkViewport* vp, const VkRect2D* sc)
+{
+    if (__atomic_load_n(&s_coop.mode, __ATOMIC_RELAXED) != VK_COOP_AUTO) return;
+    if (w < 320u || h < 180u) return;
+    const float vx0 = vp->x, vx1 = vp->x + vp->width;
+    const float vy0 = vp->y, vy1 = vp->y + vp->height;
+    const float sx0 = (float)sc->offset.x, sx1 = (float)(sc->offset.x + (int32_t)sc->extent.width);
+    const float sy0 = (float)sc->offset.y, sy1 = (float)(sc->offset.y + (int32_t)sc->extent.height);
+    const float ex0 = vx0 > sx0 ? vx0 : sx0;
+    const float ex1 = vx1 < sx1 ? vx1 : sx1;
+    const float ey0 = vy0 > sy0 ? vy0 : sy0;
+    const float ey1 = vy1 < sy1 ? vy1 : sy1;
+    const float ew = ex1 - ex0;
+    const float eh = ey1 - ey0;
+    const float fw = (float)w, fh = (float)h;
+    if (ew >= fw * 0.36f && ew <= fw * 0.56f && eh >= fh * 0.58f) {
+        if (ex0 <= fw * 0.08f && ex1 <= fw * 0.56f) s_coop.left_draws++;
+        else if (ex0 >= fw * 0.44f && ex1 >= fw * 0.90f) s_coop.right_draws++;
+    }
+}
+
+static int vk_coop_on_present_decide(void)
+{
+    const int mode = __atomic_load_n(&s_coop.mode, __ATOMIC_ACQUIRE);
+    const u32 ld = s_coop.left_draws;
+    const u32 rd = s_coop.right_draws;
+    s_coop.left_draws = 0;
+    s_coop.right_draws = 0;
+
+    int split = 0;
+    if (mode == VK_COOP_FORCE_SPLIT) {
+        split = 1;
+    } else if (mode == VK_COOP_AUTO) {
+        const int cur = __atomic_load_n(&s_coop.split_active, __ATOMIC_RELAXED);
+        const int det = (ld >= 6u && rd >= 6u);
+        if (det) {
+            if (s_coop.split_hist < 6) s_coop.split_hist++;
+        } else {
+            if (s_coop.split_hist > 0) s_coop.split_hist--;
+        }
+        if (s_coop.split_hist >= 3) split = 1;
+        else if (s_coop.split_hist == 0) split = 0;
+        else split = cur;
+    } else {
+        s_coop.split_hist = 0;
+        split = 0;
+    }
+    __atomic_store_n(&s_coop.split_active, split, __ATOMIC_RELEASE);
+    return split;
+}
+
+static void vk_coop_compute_dst_x(u32 src_w, u32 src_h, u32 dst_w, u32 dst_h,
+                                  int split_now, int32_t* out_dx0, int32_t* out_dx1)
+{
+    if (!split_now) {
+        *out_dx0 = 0;
+        *out_dx1 = (int32_t)dst_w;
+        return;
+    }
+    const int aspect = __atomic_load_n(&s_coop.aspect_mode, __ATOMIC_RELAXED);
+    u32 target_w = dst_w;
+    if (aspect == VK_COOP_ASPECT_FIT && src_h > 0u) {
+        target_w = (u32)(((u64)dst_h * src_w + src_h / 2u) / src_h);
+        if (target_w > dst_w) target_w = dst_w;
+        if (target_w < 64u) target_w = 64u;
+    } else if (aspect == VK_COOP_ASPECT_BALANCED) {
+        target_w = (dst_w * 78u) / 100u;
+    }
+    const u32 pad = (dst_w > target_w) ? ((dst_w - target_w) / 2u) : 0u;
+    *out_dx0 = (int32_t)pad;
+    *out_dx1 = (int32_t)(pad + target_w);
+}
+
+/* Blit guest surface `o` onto Phone 1 display target `dst_img` (`dst_w x dst_h`).
+ * In split mode, crops strictly the LEFT half (Player 1) so Phone 1 stays
+ * fullscreen P1 with zero split divider visible. */
+static void vk_coop_blit_p1(VkCommandBuffer cb, const vk_eng_obj* o,
+                            VkImage dst_img, u32 dst_w, u32 dst_h, int split_now)
+{
+    const int32_t sx0 = 0;
+    const int32_t sx1 = split_now ? (int32_t)((o->w * 496u) / 1000u) : (int32_t)o->w;
+    int32_t dx0 = 0, dx1 = (int32_t)dst_w;
+    vk_coop_compute_dst_x((u32)(sx1 - sx0), o->h, dst_w, dst_h, split_now, &dx0, &dx1);
+    if (dx0 > 0) {
+        static const VkClearColorValue black = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
+        VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        pvkCmdClearColorImage(cb, dst_img, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &r);
+        vk_barrier_image_on(cb, dst_img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    VkImageBlit blit = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .srcOffsets = { { sx0, 0, 0 }, { sx1, (int32_t)o->h, 1 } },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstOffsets = { { dx0, 0, 0 }, { dx1, (int32_t)dst_h, 1 } },
+    };
+    const VkFilter flt = (!split_now && o->w == dst_w && o->h == dst_h) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+    pvkCmdBlitImage(cb, o->im.img, VK_IMAGE_LAYOUT_GENERAL,
+                    dst_img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit, flt);
+}
+
+static int vk_coop_ensure_gpu(void)
+{
+    if (s_coop.gpu_ready) return 1;
+    if (s_coop.gpu_failed || !s_vk.device) return 0;
+
+    VkCommandPoolCreateInfo cpci = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = s_vk.queue_family,
+    };
+    if (pvkCreateCommandPool(s_vk.device, &cpci, NULL, &s_coop.pool) != VK_SUCCESS) {
+        s_coop.gpu_failed = 1;
+        return 0;
+    }
+    VkCommandBufferAllocateInfo cbai = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = s_coop.pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = VK_COOP_SLOTS,
+    };
+    if (pvkAllocateCommandBuffers(s_vk.device, &cbai, s_coop.cmd) != VK_SUCCESS) {
+        s_coop.gpu_failed = 1;
+        return 0;
+    }
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    for (u32 i = 0; i < VK_COOP_SLOTS; i++) {
+        if (pvkCreateFence(s_vk.device, &fci, NULL, &s_coop.fence[i]) != VK_SUCCESS) {
+            s_coop.gpu_failed = 1;
+            return 0;
+        }
+    }
+    if (vk_create_image(&s_coop.img, VK_FORMAT_R8G8B8A8_UNORM, VK_COOP_W, VK_COOP_H,
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                        VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
+        s_coop.gpu_failed = 1;
+        return 0;
+    }
+    s_coop.img_fresh = 1;
+    const VkDeviceSize rb_sz = (VkDeviceSize)VK_COOP_W * VK_COOP_H * 4u;
+    for (u32 i = 0; i < VK_COOP_SLOTS; i++) {
+        if (vk_create_host_buffer(&s_coop.rb[i], rb_sz, VK_BUFFER_USAGE_TRANSFER_DST_BIT) != 0) {
+            s_coop.gpu_failed = 1;
+            return 0;
+        }
+        __atomic_store_n(&s_coop.slot_state[i], 0, __ATOMIC_RELEASE);
+    }
+    s_coop.gpu_ready = 1;
+    VK_LOG("Co-op P2 async stream capture ready (%ux%u x %u slots)\n",
+           (unsigned)VK_COOP_W, (unsigned)VK_COOP_H, (unsigned)VK_COOP_SLOTS);
+    return 1;
+}
+
+static void vk_coop_capture_p2_async(const vk_eng_obj* o, int split_now)
+{
+    if (!o || !s_vk.device) return;
+    if (__atomic_load_n(&s_coop.mode, __ATOMIC_RELAXED) == VK_COOP_OFF) return;
+    if (!__atomic_load_n(&s_coop.client_connected, __ATOMIC_ACQUIRE)) return;
+    if (__atomic_load_n(&s_coop.stop_atomic, __ATOMIC_ACQUIRE)) return;
+    if (!vk_coop_ensure_gpu()) return;
+
+    const u32 slot = s_coop.next_slot;
+    if (__atomic_load_n(&s_coop.slot_state[slot], __ATOMIC_ACQUIRE) != 0) {
+        /* Encoder thread still reading this slot: drop frame cleanly (zero stall). */
+        return;
+    }
+    s_coop.next_slot = (slot + 1u) % VK_COOP_SLOTS;
+
+    VkCommandBuffer cb = s_coop.cmd[slot];
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (pvkResetCommandBuffer(cb, 0) != VK_SUCCESS || pvkBeginCommandBuffer(cb, &bi) != VK_SUCCESS)
+        return;
+
+    vk_cmd_after_everything(cb);
+    vk_barrier_image_on(cb, o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image_on(cb, s_coop.img.img, VK_IMAGE_ASPECT_COLOR_BIT,
+                        s_coop.img_fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL);
+    s_coop.img_fresh = 0;
+
+    /* Player 2 gets RIGHT half during split, or full screen when mirrored/menu. */
+    const int32_t sx0 = split_now ? (int32_t)((o->w * 504u) / 1000u) : 0;
+    const int32_t sx1 = (int32_t)o->w;
+    int32_t dx0 = 0, dx1 = (int32_t)VK_COOP_W;
+    vk_coop_compute_dst_x((u32)(sx1 - sx0), o->h, VK_COOP_W, VK_COOP_H, split_now, &dx0, &dx1);
+    if (dx0 > 0) {
+        static const VkClearColorValue black = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
+        VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        pvkCmdClearColorImage(cb, s_coop.img.img, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &r);
+        vk_barrier_image_on(cb, s_coop.img.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    VkImageBlit blit = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .srcOffsets = { { sx0, 0, 0 }, { sx1, (int32_t)o->h, 1 } },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstOffsets = { { dx0, 0, 0 }, { dx1, (int32_t)VK_COOP_H, 1 } },
+    };
+    pvkCmdBlitImage(cb, o->im.img, VK_IMAGE_LAYOUT_GENERAL,
+                    s_coop.img.img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_LINEAR);
+    vk_barrier_image_on(cb, s_coop.img.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+
+    VkBufferImageCopy region = {
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageExtent = { VK_COOP_W, VK_COOP_H, 1 },
+    };
+    pvkCmdCopyImageToBuffer(cb, s_coop.img.img, VK_IMAGE_LAYOUT_GENERAL,
+                            s_coop.rb[slot].buf, 1, &region);
+    VkBufferMemoryBarrier hb = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = s_coop.rb[slot].buf, .offset = 0, .size = VK_WHOLE_SIZE,
+    };
+    pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                          0, 0, NULL, 1, &hb, 0, NULL);
+    if (pvkEndCommandBuffer(cb) != VK_SUCCESS) return;
+
+    pvkResetFences(s_vk.device, 1, &s_coop.fence[slot]);
+    VkSubmitInfo si = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1, .pCommandBuffers = &cb,
+    };
+    if (vk_queue_submit(&si, s_coop.fence[slot]) != VK_SUCCESS) return;
+
+    s_vk.present_order = 1;
+    s_coop.slot_split[slot] = split_now;
+    s_coop.slot_seq[slot] = ++s_coop.next_seq;
+    __atomic_store_n(&s_coop.slot_state[slot], 1, __ATOMIC_RELEASE);
+#ifndef _WIN32
+    pthread_mutex_lock(&s_coop.mu);
+    vk_coop_cv_ensure_locked();
+    pthread_cond_signal(&s_coop.cv);
+    pthread_mutex_unlock(&s_coop.mu);
+#endif
+}
+
+static void vk_coop_wait_gpu(void)
+{
+    if (!s_coop.gpu_ready || !s_vk.device) return;
+    for (u32 i = 0; i < VK_COOP_SLOTS; i++) {
+        if (__atomic_load_n(&s_coop.slot_state[i], __ATOMIC_ACQUIRE) && s_coop.fence[i])
+            pvkWaitForFences(s_vk.device, 1, &s_coop.fence[i], VK_TRUE, UINT64_MAX);
+    }
+}
+
+#ifndef _WIN32
+static int vk_coop_acquire_ready_slot(u32 timeout_ms, u32* out_slot)
+{
+    if (__atomic_load_n(&s_coop.stop_atomic, __ATOMIC_ACQUIRE) || !s_vk.device) return -1;
+    pthread_mutex_lock(&s_coop.mu);
+    vk_coop_cv_ensure_locked();
+
+    struct timespec dl;
+    clock_gettime(s_coop.clock_id, &dl);
+    dl.tv_sec += (time_t)(timeout_ms / 1000u);
+    dl.tv_nsec += (long)((timeout_ms % 1000u) * 1000000u);
+    while (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+
+    int found = -1;
+    for (;;) {
+        if (__atomic_load_n(&s_coop.stop_atomic, __ATOMIC_ACQUIRE) || !s_vk.device) {
+            pthread_mutex_unlock(&s_coop.mu);
+            return -1;
+        }
+        /* Prefer the newest submitted slot; release any older superseded slot. */
+        u64 best_seq = 0;
+        for (u32 i = 0; i < VK_COOP_SLOTS; i++) {
+            if (__atomic_load_n(&s_coop.slot_state[i], __ATOMIC_ACQUIRE) == 1) {
+                if (s_coop.slot_seq[i] > best_seq) {
+                    best_seq = s_coop.slot_seq[i];
+                    found = (int)i;
+                }
+            }
+        }
+        if (found >= 0) {
+            __atomic_add_fetch(&s_coop.active_readers, 1, __ATOMIC_ACQ_REL);
+            /* Drop stale older slot if both were ready so latency stays lowest. */
+            for (u32 i = 0; i < VK_COOP_SLOTS; i++) {
+                if ((int)i != found && __atomic_load_n(&s_coop.slot_state[i], __ATOMIC_ACQUIRE) == 1)
+                    __atomic_store_n(&s_coop.slot_state[i], 0, __ATOMIC_RELEASE);
+            }
+            break;
+        }
+        int rc = pthread_cond_timedwait(&s_coop.cv, &s_coop.mu, &dl);
+        if (rc == ETIMEDOUT) {
+            pthread_mutex_unlock(&s_coop.mu);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&s_coop.mu);
+
+    if (pvkWaitForFences(s_vk.device, 1, &s_coop.fence[found], VK_TRUE, 250000000ull) != VK_SUCCESS) {
+        __atomic_store_n(&s_coop.slot_state[found], 0, __ATOMIC_RELEASE);
+        __atomic_sub_fetch(&s_coop.active_readers, 1, __ATOMIC_ACQ_REL);
+        return 0;
+    }
+    vk_invalidate(&s_coop.rb[found]);
+    *out_slot = (u32)found;
+    return 1;
+}
+
+static inline u8 vk_coop_clamp_u8(int v)
+{
+    return (u8)(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+
+/* Fast BT.601 studio-range RGBA8 -> YUV420 conversion directly into Android
+ * MediaCodec Image.Plane buffers (supports both NV12 uv_pstride=2 and I420 uv_pstride=1). */
+static int vk_coop_fill_yuv(u8* y_dst, u32 y_stride,
+                            u8* u_dst, u32 u_stride,
+                            u8* v_dst, u32 v_stride,
+                            u32 uv_pstride,
+                            u32* out_w, u32* out_h,
+                            int* out_split, u32 timeout_ms)
+{
+    if (!y_dst || !u_dst || !v_dst || !uv_pstride) return -1;
+    u32 slot = 0;
+    const int rc = vk_coop_acquire_ready_slot(timeout_ms, &slot);
+    if (rc <= 0) return rc;
+
+    const u8* rgba = (const u8*)s_coop.rb[slot].ptr;
+    const u32 w = VK_COOP_W;
+    const u32 h = VK_COOP_H;
+    const u32 row_bytes = w * 4u;
+    for (u32 y = 0; y < h; y += 2u) {
+        const u8* r0 = rgba + (size_t)y * row_bytes;
+        const u8* r1 = r0 + row_bytes;
+        u8* dy0 = y_dst + (size_t)y * y_stride;
+        u8* dy1 = dy0 + y_stride;
+        u8* du  = u_dst + (size_t)(y >> 1) * u_stride;
+        u8* dv  = v_dst + (size_t)(y >> 1) * v_stride;
+        for (u32 x = 0; x < w; x += 2u) {
+            const u32 x4 = x * 4u;
+            const int r00 = r0[x4 + 0], g00 = r0[x4 + 1], b00 = r0[x4 + 2];
+            const int r01 = r0[x4 + 4], g01 = r0[x4 + 5], b01 = r0[x4 + 6];
+            const int r10 = r1[x4 + 0], g10 = r1[x4 + 1], b10 = r1[x4 + 2];
+            const int r11 = r1[x4 + 4], g11 = r1[x4 + 5], b11 = r1[x4 + 6];
+
+            dy0[x + 0] = vk_coop_clamp_u8(((66 * r00 + 129 * g00 + 25 * b00 + 128) >> 8) + 16);
+            dy0[x + 1] = vk_coop_clamp_u8(((66 * r01 + 129 * g01 + 25 * b01 + 128) >> 8) + 16);
+            dy1[x + 0] = vk_coop_clamp_u8(((66 * r10 + 129 * g10 + 25 * b10 + 128) >> 8) + 16);
+            dy1[x + 1] = vk_coop_clamp_u8(((66 * r11 + 129 * g11 + 25 * b11 + 128) >> 8) + 16);
+
+            const int ra = (r00 + r01 + r10 + r11 + 2) >> 2;
+            const int ga = (g00 + g01 + g10 + g11 + 2) >> 2;
+            const int ba = (b00 + b01 + b10 + b11 + 2) >> 2;
+            const size_t uv_off = (size_t)(x >> 1) * uv_pstride;
+            du[uv_off] = vk_coop_clamp_u8(((-38 * ra - 74 * ga + 112 * ba + 128) >> 8) + 128);
+            dv[uv_off] = vk_coop_clamp_u8(((112 * ra - 94 * ga -  18 * ba + 128) >> 8) + 128);
+        }
+    }
+
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    if (out_split) *out_split = s_coop.slot_split[slot];
+    __atomic_store_n(&s_coop.slot_state[slot], 0, __ATOMIC_RELEASE);
+    __atomic_sub_fetch(&s_coop.active_readers, 1, __ATOMIC_ACQ_REL);
+    return 1;
+}
+
+static int vk_coop_fill_rgba(u8* rgba_dst, u32 dst_cap,
+                             u32* out_w, u32* out_h,
+                             int* out_split, u32 timeout_ms)
+{
+    const u32 need = VK_COOP_W * VK_COOP_H * 4u;
+    if (!rgba_dst || dst_cap < need) return -1;
+    u32 slot = 0;
+    const int rc = vk_coop_acquire_ready_slot(timeout_ms, &slot);
+    if (rc <= 0) return rc;
+
+    memcpy(rgba_dst, s_coop.rb[slot].ptr, need);
+    if (out_w) *out_w = VK_COOP_W;
+    if (out_h) *out_h = VK_COOP_H;
+    if (out_split) *out_split = s_coop.slot_split[slot];
+    __atomic_store_n(&s_coop.slot_state[slot], 0, __ATOMIC_RELEASE);
+    __atomic_sub_fetch(&s_coop.active_readers, 1, __ATOMIC_ACQ_REL);
+    return 1;
+}
+
+static void vk_coop_shutdown(void)
+{
+    __atomic_store_n(&s_coop.stop_atomic, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_coop.client_connected, 0, __ATOMIC_RELEASE);
+    pthread_mutex_lock(&s_coop.mu);
+    if (s_coop.cv_init) pthread_cond_broadcast(&s_coop.cv);
+    pthread_mutex_unlock(&s_coop.mu);
+
+    for (int w = 0; w < 50 && __atomic_load_n(&s_coop.active_readers, __ATOMIC_ACQUIRE) > 0; w++) {
+        struct timespec ts = { 0, 5000000L };
+        nanosleep(&ts, NULL);
+    }
+    if (s_vk.device && s_coop.gpu_ready) {
+        vk_device_idle();
+        for (u32 i = 0; i < VK_COOP_SLOTS; i++) {
+            vk_destroy_buffer(&s_coop.rb[i]);
+            if (s_coop.fence[i]) { pvkDestroyFence(s_vk.device, s_coop.fence[i], NULL); s_coop.fence[i] = VK_NULL_HANDLE; }
+            __atomic_store_n(&s_coop.slot_state[i], 0, __ATOMIC_RELEASE);
+        }
+        vk_destroy_image(&s_coop.img);
+        if (s_coop.pool) { pvkDestroyCommandPool(s_vk.device, s_coop.pool, NULL); s_coop.pool = VK_NULL_HANDLE; }
+    }
+    s_coop.gpu_ready = 0;
+    s_coop.gpu_failed = 0;
+}
+#else
+static int vk_coop_fill_yuv(u8* y_dst, u32 y_stride, u8* u_dst, u32 u_stride,
+                            u8* v_dst, u32 v_stride, u32 uv_pstride,
+                            u32* out_w, u32* out_h, int* out_split, u32 timeout_ms)
+{
+    (void)y_dst; (void)y_stride; (void)u_dst; (void)u_stride; (void)v_dst; (void)v_stride;
+    (void)uv_pstride; (void)out_w; (void)out_h; (void)out_split; (void)timeout_ms;
+    return -1;
+}
+static int vk_coop_fill_rgba(u8* rgba_dst, u32 dst_cap, u32* out_w, u32* out_h,
+                             int* out_split, u32 timeout_ms)
+{
+    (void)rgba_dst; (void)dst_cap; (void)out_w; (void)out_h; (void)out_split; (void)timeout_ms;
+    return -1;
+}
+static void vk_coop_shutdown(void) { s_coop.gpu_ready = 0; }
+#endif
+
+/* ---------------------------------------------------------------------------
  * GPU Optical-Flow 2x Frame Generation (PS3RECOMP_VK_FRAME_GEN = off|flow|blend)
  *
  * Android Vulkan GPUs (Adreno / Mali) do not expose NVIDIA Tensor Cores, so
@@ -4742,19 +5297,11 @@ static int vk_fg_try_present(vk_eng_obj* o)
     }
     const u32 pslot = s_vk.present_slot;
 
-    /* Copy/blit the newly rendered guest surface into hist[next_slot]. */
+    /* Copy/blit the newly rendered guest surface into hist[next_slot] (full or P1 left half in Co-op Split). */
     vk_barrier_image_on(cb, o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     vk_barrier_image_on(cb, s_fg.hist[next_slot].img, VK_IMAGE_ASPECT_COLOR_BIT,
                         s_fg.hist_fresh[next_slot] ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL);
-    VkImageBlit blit = {
-        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .srcOffsets = { { 0, 0, 0 }, { (int32_t)o->w, (int32_t)o->h, 1 } },
-        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .dstOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
-    };
-    pvkCmdBlitImage(cb, o->im.img, VK_IMAGE_LAYOUT_GENERAL,
-                    s_fg.hist[next_slot].img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
-                    (o->w == s_vk.width && o->h == s_vk.height) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    vk_coop_blit_p1(cb, o, s_fg.hist[next_slot].img, s_vk.width, s_vk.height, vk_coop_is_split_active());
     s_fg.hist_fresh[next_slot] = 0;
 
     if (!s_vk.present_acquire[pslot]) {
@@ -4936,6 +5483,8 @@ static void vk_eng_present(void* user, u32 surface)
     }
     if (s_eb_pending) vk_eng_flush_async(VK_FLUSH_PRESENT);   /* GPU executes in queue order before present blit */
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
+    const int coop_split = vk_coop_on_present_decide();
+    if (o) vk_coop_capture_p2_async(o, coop_split);
     if (!vk_fg_try_present(o)) {
         pthread_mutex_lock(&s_vk.present_mu);
         VkCommandBuffer cb = vk_present_record_begin();
@@ -4943,16 +5492,7 @@ static void vk_eng_present(void* user, u32 surface)
             if (o) {
                 vk_barrier_image_on(cb, o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
                 vk_barrier_image_on(cb, s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-                VkImageBlit blit = {
-                    .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                    .srcOffsets = { { 0, 0, 0 }, { (int32_t)o->w, (int32_t)o->h, 1 } },
-                    .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                    .dstOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
-                };
-                pvkCmdBlitImage(cb, o->im.img, VK_IMAGE_LAYOUT_GENERAL,
-                                s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
-                                (o->w == s_vk.width && o->h == s_vk.height) ? VK_FILTER_NEAREST
-                                                                            : VK_FILTER_LINEAR);
+                vk_coop_blit_p1(cb, o, s_vk.color.img, s_vk.width, s_vk.height, coop_split);
             }
             vk_present_record_end(cb);
         }
@@ -7441,6 +7981,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         sc.offset.x = (int32_t)x0; sc.offset.y = (int32_t)y0;
         sc.extent.width = x1 > x0 ? x1 - x0 : 0; sc.extent.height = y1 > y0 ? y1 - y0 : 0;
     }
+    vk_coop_observe_draw(w, h, &vp, &sc);
     const u32 sref = s_e2.stencil_ref & 0xFFu;
     if (!batched || !s_eb.dyn_valid || memcmp(&s_eb.open_vp, &vp, sizeof vp) != 0) {
         pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp);
@@ -7797,6 +8338,7 @@ void rsx_vulkan_backend_shutdown(void)
             vk_present_window();         /* FIFO: paced by the display */
         }
     }
+    vk_coop_shutdown();
     vk_fg_shutdown();
     if (s_vk.device) {
         vk_device_idle();
@@ -7943,6 +8485,44 @@ int rsx_vulkan_backend_fg_mode(void)
 unsigned rsx_vulkan_backend_fg_frames(void)
 {
     return __atomic_load_n(&s_fg.gen_frames, __ATOMIC_RELAXED);
+}
+
+void rsx_vulkan_backend_coop_configure(int mode, int aspect_mode)
+{
+    vk_coop_configure(mode, aspect_mode);
+}
+
+void rsx_vulkan_backend_coop_set_client_connected(int connected)
+{
+    vk_coop_set_client_connected(connected);
+}
+
+int rsx_vulkan_backend_coop_get_mode(void)
+{
+    return vk_coop_get_mode();
+}
+
+int rsx_vulkan_backend_coop_is_split_active(void)
+{
+    return vk_coop_is_split_active();
+}
+
+int rsx_vulkan_backend_coop_fill_yuv(u8* y_dst, u32 y_stride,
+                                     u8* u_dst, u32 u_stride,
+                                     u8* v_dst, u32 v_stride,
+                                     u32 uv_pstride,
+                                     u32* out_w, u32* out_h,
+                                     int* out_split, u32 timeout_ms)
+{
+    return vk_coop_fill_yuv(y_dst, y_stride, u_dst, u_stride, v_dst, v_stride,
+                            uv_pstride, out_w, out_h, out_split, timeout_ms);
+}
+
+int rsx_vulkan_backend_coop_fill_rgba(u8* rgba_dst, u32 dst_cap,
+                                      u32* out_w, u32* out_h,
+                                      int* out_split, u32 timeout_ms)
+{
+    return vk_coop_fill_rgba(rgba_dst, dst_cap, out_w, out_h, out_split, timeout_ms);
 }
 
 #endif /* !_WIN32 || PS3RECOMP_RSX_VULKAN */

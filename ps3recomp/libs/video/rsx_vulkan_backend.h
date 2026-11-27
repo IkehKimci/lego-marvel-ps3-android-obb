@@ -129,6 +129,24 @@ int  rsx_vulkan_backend_guest_programs(void);
 int      rsx_vulkan_backend_fg_mode(void);
 unsigned rsx_vulkan_backend_fg_frames(void);
 
+/* Dual-Screen 2-Phone Wi-Fi Co-op (Host splits P1 left -> local display,
+ * P2 right -> async 640x360 stream capture for Phone 2).
+ *   mode:   0=off, 1=auto split-detect, 2=force L|R split, 3=full mirror
+ *   aspect: 0=balanced (78% width), 1=fill (100% width), 2=fit (native aspect) */
+void rsx_vulkan_backend_coop_configure(int mode, int aspect_mode);
+void rsx_vulkan_backend_coop_set_client_connected(int connected);
+int  rsx_vulkan_backend_coop_get_mode(void);
+int  rsx_vulkan_backend_coop_is_split_active(void);
+int  rsx_vulkan_backend_coop_fill_yuv(u8* y_dst, u32 y_stride,
+                                      u8* u_dst, u32 u_stride,
+                                      u8* v_dst, u32 v_stride,
+                                      u32 uv_pstride,
+                                      u32* out_w, u32* out_h,
+                                      int* out_split, u32 timeout_ms);
+int  rsx_vulkan_backend_coop_fill_rgba(u8* rgba_dst, u32 dst_cap,
+                                       u32* out_w, u32* out_h,
+                                       int* out_split, u32 timeout_ms);
+
 #ifdef __ANDROID__
 /* Native Android window bridge (ANativeWindow*). Call before init or on
  * SurfaceHolder / NativeActivity lifecycle changes (NULL when surface lost). */

@@ -21,6 +21,7 @@ import android.view.WindowManager;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
+import java.nio.ByteBuffer;
 import java.util.Locale;
 
 public class GameActivity extends NativeActivity {
@@ -34,10 +35,26 @@ public class GameActivity extends NativeActivity {
     private static native int nativeGetRenderHeight();
     private static native long nativeGetVirtualPadState();
 
+    static native void nativeCoopSetClientConnected(int connected);
+    static native void nativeCoopSetMode(int mode, int aspect);
+    static native int nativeCoopGetStatus();
+    static native int nativeCoopFillYuvPlanes(
+            ByteBuffer yBuf, int yStride,
+            ByteBuffer uBuf, int uStride,
+            ByteBuffer vBuf, int vStride,
+            int uvPixelStride,
+            int[] outMeta, int timeoutMs);
+    static native int nativeCoopFillRgba(ByteBuffer rgbaBuf, int[] outMeta, int timeoutMs);
+    static native void nativeCoopPushP2Input(int btns, int lx, int ly, int rx, int ry, int l2, int r2);
+    static native void nativeCoopSetAudioEnabled(int enabled);
+    static native int nativeCoopReadAudioAdpcm(byte[] outBuf);
+
     private HudOverlayView hudOverlay;
     private boolean overlayAttached = false;
     private boolean showFps = true;
     private boolean showTouch = true;
+    private CoopStreamServer coopServer;
+    private String coopLocalIp = "";
 
     private final Handler fpsHandler = new Handler(Looper.getMainLooper());
     private long lastSampleNs = 0L;
@@ -437,17 +454,45 @@ public class GameActivity extends NativeActivity {
         return defVal;
     }
 
+    private String readStringSetting(String key, String defVal) {
+        Intent intent = getIntent();
+        if (intent != null && intent.hasExtra(key)) {
+            String v = intent.getStringExtra(key);
+            if (v != null && !v.isEmpty()) return v;
+        }
+        File[] cands = { new File(SHARED_CFG), new File(getFilesDir(), "settings.ini") };
+        for (File f : cands) {
+            if (!f.isFile()) continue;
+            try (BufferedReader br = new BufferedReader(new FileReader(f))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    line = line.trim();
+                    if (line.isEmpty() || line.startsWith("#")) continue;
+                    int eq = line.indexOf('=');
+                    if (eq > 0 && key.equals(line.substring(0, eq).trim())) {
+                        return line.substring(eq + 1).trim();
+                    }
+                }
+                break;
+            } catch (Exception ignored) {
+            }
+        }
+        return defVal;
+    }
+
     private void updateFpsSample() {
         if (hudOverlay == null) return;
         long packed = 0L;
         long fgPacked = 0L;
         int padState = 0;
+        int coopStatus = 0;
         int resH = 720;
         if (sNativeLinked) {
             try {
                 packed = nativeGetFrameStats();
                 fgPacked = nativeGetFrameGenStats();
                 padState = nativeGetGamepadState();
+                coopStatus = nativeCoopGetStatus();
                 int h = nativeGetRenderHeight();
                 if (h > 0) resH = h;
             } catch (Throwable ignored) {
@@ -458,13 +503,46 @@ public class GameActivity extends NativeActivity {
         long fgFrames = (fgPacked >>> 8) & 0xFFFFFFFFL;
         int padCount = Math.max(padState & 0xF, countConnectedGamepads());
         String padTag = (padCount > 0) ? (padCount > 1 ? "PAD×2  •  " : "PAD  •  ") : "";
+
+        int coopMode = coopStatus & 0xF;
+        boolean coopSplit = ((coopStatus >>> 4) & 1) != 0;
+        boolean coopClient = ((coopStatus >>> 8) & 1) != 0;
+        boolean coopUdp = ((coopStatus >>> 9) & 1) != 0;
+        String coopTag = "";
+        if (coopMode > 0) {
+            if (coopServer != null && coopServer.isRelayMode()) {
+                if (coopClient || coopUdp || coopServer.isRelayPeerOnline()) {
+                    coopTag = (coopSplit ? "P1 SPLIT" : "ONLINE P2") + " (R:" + coopServer.getRelayPortLabel() + ")  •  ";
+                } else {
+                    String st = coopServer.getRelayHudState();
+                    coopTag = ((st != null && !st.isEmpty()) ? st : ("ONLINE ROOM " + coopServer.getRelayPortLabel())) + "  •  ";
+                }
+            } else if (coopClient || coopUdp) {
+                coopTag = coopSplit ? "P1 SPLIT  •  " : "CO-OP P2  •  ";
+            } else {
+                String freshIp = CoopStreamServer.getLocalIpv4(this);
+                if (freshIp != null && !freshIp.isEmpty()) coopLocalIp = freshIp;
+                String shownIp = (coopLocalIp != null && !coopLocalIp.isEmpty()) ? coopLocalIp : "NYALAKAN WIFI/HOTSPOT";
+                String srvTag = "";
+                if (coopServer != null) {
+                    if (coopServer.isServerListening()) {
+                        srvTag = ":31161";
+                    } else {
+                        String berr = coopServer.getServerBindError();
+                        srvTag = (berr != null && !berr.isEmpty()) ? (" [ERR:" + berr + "]") : " [START...]";
+                    }
+                }
+                coopTag = "HOST " + shownIp + srvTag + "  •  ";
+            }
+        }
+        String prefix = coopTag + padTag;
         long nowNs = SystemClock.elapsedRealtimeNanos();
 
         if (lastSampleNs == 0L || lastFrames < 0L || frames < lastFrames || fgFrames < lastFgFrames) {
             lastSampleNs = nowNs;
             lastFrames = frames;
             lastFgFrames = fgFrames;
-            hudOverlay.updateFps(-1f, String.format(Locale.US, "%sFPS: --  •  %dp", padTag, resH));
+            hudOverlay.updateFps(-1f, String.format(Locale.US, "%sFPS: --  •  %dp", prefix, resH));
             return;
         }
 
@@ -476,7 +554,7 @@ public class GameActivity extends NativeActivity {
         lastFgFrames = fgFrames;
 
         if (frames == 0L) {
-            hudOverlay.updateFps(-1f, String.format(Locale.US, "%sFPS: -- (Boot)  •  %dp", padTag, resH));
+            hudOverlay.updateFps(-1f, String.format(Locale.US, "%sFPS: -- (Boot)  •  %dp", prefix, resH));
             return;
         }
 
@@ -487,16 +565,16 @@ public class GameActivity extends NativeActivity {
                     float dispFps = (float) ((df + dfg) / dtSec);
                     hudOverlay.updateFps(dispFps,
                             String.format(Locale.US, "%s%.1f FPS (%.0f×2 FG)  •  %dp",
-                                    padTag, dispFps, realFps, resH));
+                                    prefix, dispFps, realFps, resH));
                 } else {
                     float ms = (float) (1000.0 * dtSec / df);
                     hudOverlay.updateFps(realFps,
                             String.format(Locale.US, "%s%.1f FPS  •  %.1f ms  •  %dp",
-                                    padTag, realFps, ms, resH));
+                                    prefix, realFps, ms, resH));
                 }
             } else {
                 hudOverlay.updateFps(0f,
-                        String.format(Locale.US, "%s0.0 FPS  •  -- ms  •  %dp", padTag, resH));
+                        String.format(Locale.US, "%s0.0 FPS  •  -- ms  •  %dp", prefix, resH));
             }
         }
     }
@@ -562,6 +640,19 @@ public class GameActivity extends NativeActivity {
         applyImmersiveMode();
         showTouch = readBoolSetting("touch_controls", true);
         showFps = readBoolSetting("show_fps", true);
+        String coopModeStr = readStringSetting("coop_mode", "off");
+        if (!"off".equalsIgnoreCase(coopModeStr) && !"0".equals(coopModeStr)) {
+            String netMode = readStringSetting("coop_net_mode", "relay");
+            String relayHost = readStringSetting("coop_host_ip", "");
+            String relayPort = readStringSetting("coop_relay_port", "31161");
+            String relayPass = readStringSetting("coop_relay_pass", "");
+            String quality = readStringSetting("coop_quality", "wan");
+            boolean audioOn = readBoolSetting("coop_audio", true);
+            coopLocalIp = CoopStreamServer.getLocalIpv4(this);
+            coopServer = new CoopStreamServer(this, netMode, relayHost, relayPort, relayPass, quality, audioOn);
+            coopServer.start();
+            showFps = true; // always show top status pill in Co-op Host mode so status is visible
+        }
         if (showTouch || showFps) {
             hudOverlay = new HudOverlayView(this, showTouch, showFps);
             getWindow().getDecorView().post(this::attachHudOverlay);
@@ -612,6 +703,10 @@ public class GameActivity extends NativeActivity {
 
     @Override
     protected void onDestroy() {
+        if (coopServer != null) {
+            coopServer.stop();
+            coopServer = null;
+        }
         detachHudOverlay();
         sActiveInstances = Math.max(0, sActiveInstances - 1);
         super.onDestroy();

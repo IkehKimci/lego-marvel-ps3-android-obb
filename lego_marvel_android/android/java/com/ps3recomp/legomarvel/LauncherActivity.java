@@ -11,6 +11,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.Settings;
+import android.text.InputType;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.InputDevice;
@@ -19,6 +20,7 @@ import android.view.ViewGroup;
 import android.view.Window;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Spinner;
@@ -37,6 +39,9 @@ import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.InputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetSocketAddress;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -85,8 +90,17 @@ public class LauncherActivity extends Activity {
     private ArrayAdapter<DriverEntry> driverAdapter;
 
     private TextView statusBadgeText;
+    private TextView coopIpBadge;
     private TextView gamepadStatusText;
     private TextView logStatusText;
+    private Spinner  coopNetModeSpinner;
+    private Spinner  coopModeSpinner;
+    private Spinner  coopAspectSpinner;
+    private Spinner  coopQualitySpinner;
+    private EditText coopHostIpEdit;
+    private EditText coopRelayPortEdit;
+    private EditText coopRelayPassEdit;
+    private Switch   swCoopAudio;
     private Spinner  driverSpinner;
     private Spinner  resSpinner;
     private Spinner  fpsSpinner;
@@ -140,6 +154,34 @@ public class LauncherActivity extends Activity {
             "Nintendo / Switch (Swap A↔B & X↔Y)"
     };
     private final String[] gamepadLayoutValues = { "standard", "nintendo" };
+
+    private final String[] coopNetModeLabels = {
+            "🌐 Server Online (Relay — Bisa Beda Wi-Fi / 4G / 5G)",
+            "📶 LAN / Wi-Fi Langsung (1 Jaringan)"
+    };
+    private final String[] coopNetModeValues = { "relay", "lan" };
+
+    private final String[] coopModeLabels = {
+            "Off (Solo / 1 HP)",
+            "Auto Split (HP 1 = P1, HP 2 = P2 saat Split)",
+            "Selalu Split Kiri|Kanan (Paksa P1|P2)",
+            "Full Mirror (HP 2 Jadi Layar + Stick P2)"
+    };
+    private final String[] coopModeValues = { "off", "auto", "split", "mirror" };
+
+    private final String[] coopAspectLabels = {
+            "Seimbang (78% — Rekomendasi)",
+            "Penuh 100% (Full Stretch)",
+            "Proporsi Asli (Fit / Tanpa Stretch)"
+    };
+    private final String[] coopAspectValues = { "balanced", "fill", "fit" };
+
+    private final String[] coopQualityLabels = {
+            "Online Stabil (1.5 Mbps, 30 FPS — Rekomendasi)",
+            "Hemat Kuota / Sinyal Lemah (800 Kbps, 24 FPS)",
+            "Tinggi / Wi-Fi Cepat (3.5 Mbps, 30 FPS)"
+    };
+    private final String[] coopQualityValues = { "wan", "low", "high" };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -345,6 +387,124 @@ public class LauncherActivity extends Activity {
         playBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
         playBtn.setPadding(dp(16), dp(14), dp(16), dp(14));
         header.addView(playBtn);
+
+        // Card 0: Co-op 2 HP Online (Server Relay Multi-Room / LAN)
+        LinearLayout coopCard = makeCard(root, "Co-op 2 HP Online (Server Relay / Multi-Room)");
+
+        coopIpBadge = new TextView(this);
+        coopIpBadge.setTextColor(Color.parseColor("#58A6FF"));
+        coopIpBadge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        coopIpBadge.setTypeface(Typeface.MONOSPACE);
+        coopIpBadge.setBackground(roundBox(Color.parseColor("#0D1117"), COL_BORDER, 8));
+        coopIpBadge.setPadding(dp(10), dp(8), dp(10), dp(8));
+        LinearLayout.LayoutParams cilp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        cilp.bottomMargin = dp(8);
+        coopIpBadge.setLayoutParams(cilp);
+        coopCard.addView(coopIpBadge);
+
+        makeLabel(coopCard, "Mode Koneksi Co-op (HP 1 & HP 2 harus sama)");
+        coopNetModeSpinner = makeSpinner(coopCard, darkStringAdapter(coopNetModeLabels));
+
+        makeLabel(coopCard, "Alamat Server Online (domain Render/Cloudflare/VPS) atau IP LAN");
+        coopHostIpEdit = new EditText(this);
+        coopHostIpEdit.setHint("Contoh: lego-coop.onrender.com atau IP VPS");
+        coopHostIpEdit.setHintTextColor(COL_MUTED);
+        coopHostIpEdit.setTextColor(COL_TEXT);
+        coopHostIpEdit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        coopHostIpEdit.setTypeface(Typeface.MONOSPACE);
+        coopHostIpEdit.setSingleLine(true);
+        coopHostIpEdit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        coopHostIpEdit.setBackground(roundBox(Color.parseColor("#21262D"), COL_BORDER, 8));
+        coopHostIpEdit.setPadding(dp(12), dp(10), dp(12), dp(10));
+        LinearLayout.LayoutParams iplp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        iplp.bottomMargin = dp(8);
+        coopHostIpEdit.setLayoutParams(iplp);
+        coopCard.addView(coopHostIpEdit);
+
+        // Side-by-side Port / Room Number + Password Room
+        LinearLayout portPassRow = new LinearLayout(this);
+        portPassRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams pplp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        pplp.bottomMargin = dp(8);
+        portPassRow.setLayoutParams(pplp);
+
+        LinearLayout portCol = new LinearLayout(this);
+        portCol.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams pclp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.9f);
+        pclp.rightMargin = dp(8);
+        portCol.setLayoutParams(pclp);
+        makeLabel(portCol, "Port / No. Room (1–65535)");
+        coopRelayPortEdit = new EditText(this);
+        coopRelayPortEdit.setHint("31161");
+        coopRelayPortEdit.setHintTextColor(COL_MUTED);
+        coopRelayPortEdit.setTextColor(COL_TEXT);
+        coopRelayPortEdit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        coopRelayPortEdit.setTypeface(Typeface.MONOSPACE);
+        coopRelayPortEdit.setSingleLine(true);
+        coopRelayPortEdit.setInputType(InputType.TYPE_CLASS_NUMBER);
+        coopRelayPortEdit.setBackground(roundBox(Color.parseColor("#21262D"), COL_BORDER, 8));
+        coopRelayPortEdit.setPadding(dp(12), dp(10), dp(12), dp(10));
+        portCol.addView(coopRelayPortEdit);
+
+        LinearLayout passCol = new LinearLayout(this);
+        passCol.setOrientation(LinearLayout.VERTICAL);
+        passCol.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.1f));
+        makeLabel(passCol, "Password Room (Rahasia)");
+        coopRelayPassEdit = new EditText(this);
+        coopRelayPassEdit.setHint("Misal: marvel123");
+        coopRelayPassEdit.setHintTextColor(COL_MUTED);
+        coopRelayPassEdit.setTextColor(COL_TEXT);
+        coopRelayPassEdit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        coopRelayPassEdit.setTypeface(Typeface.MONOSPACE);
+        coopRelayPassEdit.setSingleLine(true);
+        coopRelayPassEdit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+        coopRelayPassEdit.setBackground(roundBox(Color.parseColor("#21262D"), COL_BORDER, 8));
+        coopRelayPassEdit.setPadding(dp(12), dp(10), dp(12), dp(10));
+        passCol.addView(coopRelayPassEdit);
+
+        portPassRow.addView(portCol);
+        portPassRow.addView(passCol);
+        coopCard.addView(portPassRow);
+
+        makeLabel(coopCard, "HP 1 (Host — punya OBB): Mode Layar Co-op");
+        coopModeSpinner = makeSpinner(coopCard, darkStringAdapter(coopModeLabels));
+
+        makeLabel(coopCard, "Proporsi Layar Split (HP 1 = P1 Full, HP 2 = P2 Full)");
+        coopAspectSpinner = makeSpinner(coopCard, darkStringAdapter(coopAspectLabels));
+
+        makeLabel(coopCard, "Kualitas Stream Video (Bitrate Online)");
+        coopQualitySpinner = makeSpinner(coopCard, darkStringAdapter(coopQualityLabels));
+
+        swCoopAudio = makeSwitchRow(coopCard, "Kirim Suara Game ke HP 2 (Audio Online)",
+                "Stream audio stereo 24 kHz ke HP 2 (ketuk bar atas di HP 2 untuk mute cepat)");
+
+        LinearLayout coopBtns = new LinearLayout(this);
+        coopBtns.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams cblp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        cblp.topMargin = dp(4);
+        cblp.bottomMargin = dp(6);
+        coopBtns.setLayoutParams(cblp);
+
+        Button btnFindHost = makeButton("⚡ Tes Server / Cari LAN", COL_BLUE, v -> testOrDiscoverCoop());
+        Button btnJoinP2   = makeButton("📱 GABUNG PLAYER 2 (HP 2)", COL_GREEN, v -> launchCoopClient());
+        LinearLayout.LayoutParams cb1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.95f);
+        cb1.rightMargin = dp(6);
+        btnFindHost.setLayoutParams(cb1);
+        btnJoinP2.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.25f));
+        coopBtns.addView(btnFindHost);
+        coopBtns.addView(btnJoinP2);
+        coopCard.addView(coopBtns);
+
+        TextView coopHint = new TextView(this);
+        coopHint.setText("Multi-Room Online: Tiap pasang pemain bisa memakai nomor Port berbeda (31161, 31162, 7777, dst) "
+                + "& Password sendiri di server yang sama! Di dalam game pilih Options → Split Screen → Fixed (Vertical).");
+        coopHint.setTextColor(COL_MUTED);
+        coopHint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        coopCard.addView(coopHint);
 
         // Card 1: GPU Driver (AdrenoTools / Turnip)
         LinearLayout gpuCard = makeCard(root, "Driver GPU Vulkan (AdrenoTools / Turnip)");
@@ -605,6 +765,12 @@ public class LauncherActivity extends Activity {
 
     private void refreshStatus() {
         refreshGamepadStatus();
+        if (coopIpBadge != null) {
+            String ipSummary = CoopStreamServer.getLocalIpv4Summary(this);
+            coopIpBadge.setText(String.format(Locale.US,
+                    "Mode Online      : Multi-Room (Port Bebas + Password SHA-256)\nIP LAN Lokal     : %s\nHP 2 (Client)    : Cukup install APK saja (TIDAK butuh OBB!)",
+                    ipSummary));
+        }
         File activeObb = findActiveObbFile();
         boolean permOk = hasStoragePermission();
         if (activeObb != null) {
@@ -617,7 +783,7 @@ public class LauncherActivity extends Activity {
                     SHARED_LOGS));
         } else {
             statusBadgeText.setText(String.format(Locale.US,
-                    "Mode Data : OBB TIDAK DITEMUKAN\nLetakkan  : Android/obb/com.ps3recomp.legomarvel/\nStorage   : %s\nLog Dir   : %s",
+                    "Mode Data : OBB TIDAK DITEMUKAN (HP 2 Co-op TIDAK butuh OBB)\nLetakkan  : Android/obb/com.ps3recomp.legomarvel/\nStorage   : %s\nLog Dir   : %s",
                     permOk ? "Diizinkan (All Files)" : "PERLU IZIN / OBB",
                     SHARED_LOGS));
         }
@@ -908,6 +1074,35 @@ public class LauncherActivity extends Activity {
         for (int i = 0; i < gamepadLayoutValues.length; i++)
             if (gamepadLayoutValues[i].equals(padLayout)) gamepadLayoutSpinner.setSelection(i);
 
+        String coopNetMode = m.getOrDefault("coop_net_mode", "relay");
+        for (int i = 0; i < coopNetModeValues.length; i++)
+            if (coopNetModeValues[i].equals(coopNetMode)) coopNetModeSpinner.setSelection(i);
+
+        String coopMode = m.getOrDefault("coop_mode", "off");
+        for (int i = 0; i < coopModeValues.length; i++)
+            if (coopModeValues[i].equals(coopMode)) coopModeSpinner.setSelection(i);
+
+        String coopAspect = m.getOrDefault("coop_aspect", "balanced");
+        for (int i = 0; i < coopAspectValues.length; i++)
+            if (coopAspectValues[i].equals(coopAspect)) coopAspectSpinner.setSelection(i);
+
+        String coopQuality = m.getOrDefault("coop_quality", "wan");
+        for (int i = 0; i < coopQualityValues.length; i++)
+            if (coopQualityValues[i].equals(coopQuality)) coopQualitySpinner.setSelection(i);
+
+        if (coopHostIpEdit != null) {
+            coopHostIpEdit.setText(m.getOrDefault("coop_host_ip", ""));
+        }
+        if (coopRelayPortEdit != null) {
+            coopRelayPortEdit.setText(m.getOrDefault("coop_relay_port", "31161"));
+        }
+        if (coopRelayPassEdit != null) {
+            coopRelayPassEdit.setText(m.getOrDefault("coop_relay_pass", ""));
+        }
+        if (swCoopAudio != null) {
+            swCoopAudio.setChecked(!"0".equals(m.getOrDefault("coop_audio", "1")));
+        }
+
         swTurbo.setChecked("1".equals(m.getOrDefault("adreno_turbo", "0")));
         swLowEnd.setChecked("1".equals(m.getOrDefault("low_end_mode", "0")));
         swGuestShaders.setChecked(!"0".equals(m.getOrDefault("guest_shaders", "1")));
@@ -937,6 +1132,11 @@ public class LauncherActivity extends Activity {
         DriverEntry drv = (DriverEntry) driverSpinner.getSelectedItem();
         if (drv == null) drv = drivers.get(0);
 
+        String hostIp = (coopHostIpEdit != null) ? coopHostIpEdit.getText().toString().trim() : "";
+        String relayPort = (coopRelayPortEdit != null) ? coopRelayPortEdit.getText().toString().trim() : "31161";
+        if (relayPort.isEmpty()) relayPort = "31161";
+        String relayPass = (coopRelayPassEdit != null) ? coopRelayPassEdit.getText().toString() : "";
+
         StringBuilder sb = new StringBuilder();
         sb.append("# LEGO Marvel Super Heroes (BLUS31161) Android Launcher Settings\n");
         sb.append("resolution=").append(resValues[resSpinner.getSelectedItemPosition()]).append("\n");
@@ -946,6 +1146,14 @@ public class LauncherActivity extends Activity {
         sb.append("low_end_mode=").append(swLowEnd.isChecked() ? "1" : "0").append("\n");
         sb.append("gamepad_layout=").append(gamepadLayoutValues[gamepadLayoutSpinner.getSelectedItemPosition()]).append("\n");
         sb.append("gamepad_autohide=").append(swGamepadAutohide.isChecked() ? "1" : "0").append("\n");
+        sb.append("coop_net_mode=").append(coopNetModeValues[coopNetModeSpinner.getSelectedItemPosition()]).append("\n");
+        sb.append("coop_mode=").append(coopModeValues[coopModeSpinner.getSelectedItemPosition()]).append("\n");
+        sb.append("coop_aspect=").append(coopAspectValues[coopAspectSpinner.getSelectedItemPosition()]).append("\n");
+        sb.append("coop_quality=").append(coopQualityValues[coopQualitySpinner.getSelectedItemPosition()]).append("\n");
+        sb.append("coop_host_ip=").append(hostIp).append("\n");
+        sb.append("coop_relay_port=").append(relayPort).append("\n");
+        sb.append("coop_relay_pass=").append(relayPass).append("\n");
+        sb.append("coop_audio=").append((swCoopAudio == null || swCoopAudio.isChecked()) ? "1" : "0").append("\n");
         sb.append("guest_shaders=").append(swGuestShaders.isChecked() ? "1" : "0").append("\n");
         sb.append("direct_present=").append(swDirectPresent.isChecked() ? "1" : "0").append("\n");
         sb.append("show_fps=").append(swShowFps.isChecked() ? "1" : "0").append("\n");
@@ -986,6 +1194,14 @@ public class LauncherActivity extends Activity {
         scalingSpinner.setSelection(0);
         fgSpinner.setSelection(0);
         gamepadLayoutSpinner.setSelection(0);
+        coopNetModeSpinner.setSelection(0);
+        coopModeSpinner.setSelection(0);
+        coopAspectSpinner.setSelection(0);
+        coopQualitySpinner.setSelection(0);
+        if (coopHostIpEdit != null) coopHostIpEdit.setText("");
+        if (coopRelayPortEdit != null) coopRelayPortEdit.setText("31161");
+        if (coopRelayPassEdit != null) coopRelayPassEdit.setText("");
+        if (swCoopAudio != null) swCoopAudio.setChecked(true);
         swTurbo.setChecked(false);
         swLowEnd.setChecked(false);
         swGuestShaders.setChecked(true);
@@ -1000,6 +1216,278 @@ public class LauncherActivity extends Activity {
         Toast.makeText(this, "Pengaturan dikembalikan ke default", Toast.LENGTH_SHORT).show();
     }
 
+    private volatile boolean discoveringHost = false;
+
+    private String probeTcpCoopHost(String ip, android.net.Network wifiNet) {
+        java.net.Socket s = null;
+        try {
+            s = (wifiNet != null) ? wifiNet.getSocketFactory().createSocket() : new java.net.Socket();
+            s.connect(new InetSocketAddress(ip, CoopStreamServer.VIDEO_TCP_PORT), 260);
+            s.setSoTimeout(400);
+            s.getOutputStream().write(new byte[]{'P', 'R', 'B', 'E'});
+            s.getOutputStream().flush();
+            byte[] resp = new byte[96];
+            int n = s.getInputStream().read(resp);
+            if (n > 0) {
+                String txt = new String(resp, 0, n, "UTF-8").trim();
+                if (txt.startsWith("LMCOOP1|")) {
+                    return ip;
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            CoopStreamServer.closeQuietly(s);
+        }
+        return null;
+    }
+
+    private void discoverCoopHost() {
+        if (discoveringHost) {
+            Toast.makeText(this, "Sedang mencari Host di jaringan...", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        discoveringHost = true;
+        Toast.makeText(this, "Memindai Host HP 1 di Wi-Fi / Hotspot (UDP + LAN Scan)...", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            final java.util.concurrent.atomic.AtomicReference<String> found = new java.util.concurrent.atomic.AtomicReference<>(null);
+            android.net.wifi.WifiManager.MulticastLock mlock = CoopStreamServer.acquireMulticastLock(this, "LegoMarvelDiscover");
+            List<CoopStreamServer.LanEndpoint> myEps = CoopStreamServer.getLanEndpoints(this);
+            java.util.Set<String> myIps = new java.util.HashSet<>();
+            for (CoopStreamServer.LanEndpoint ep : myEps) myIps.add(ep.ip);
+            android.net.Network wifiNet = CoopStreamServer.findWifiNetwork(this);
+
+            // Thread 1: Listen for Host UDP :31160 beacon AND actively send LMCOOP_PROBE (unicast reply)
+            Thread udpThread = new Thread(() -> {
+                DatagramSocket rxSock = null;
+                DatagramSocket txSock = null;
+                try {
+                    rxSock = new DatagramSocket(null);
+                    rxSock.setReuseAddress(true);
+                    rxSock.setBroadcast(true);
+                    rxSock.bind(new InetSocketAddress(CoopStreamServer.DISCOVERY_UDP_PORT));
+                    rxSock.setSoTimeout(300);
+
+                    txSock = new DatagramSocket();
+                    txSock.setBroadcast(true);
+                    txSock.setSoTimeout(250);
+                    if (wifiNet != null) {
+                        try { wifiNet.bindSocket(txSock); } catch (Throwable ignored) {}
+                    }
+
+                    byte[] probeData = "LMCOOP_PROBE".getBytes("UTF-8");
+                    // Send active probe to subnet broadcasts, gateway .1, and global broadcast
+                    for (CoopStreamServer.LanEndpoint ep : myEps) {
+                        try {
+                            txSock.send(new DatagramPacket(probeData, probeData.length,
+                                    java.net.InetAddress.getByName(ep.broadcast), CoopStreamServer.DISCOVERY_UDP_PORT));
+                        } catch (Throwable ignored) {}
+                        int dot = ep.ip.lastIndexOf('.');
+                        if (dot > 0) {
+                            try {
+                                String gw = ep.ip.substring(0, dot + 1) + "1";
+                                txSock.send(new DatagramPacket(probeData, probeData.length,
+                                        java.net.InetAddress.getByName(gw), CoopStreamServer.DISCOVERY_UDP_PORT));
+                            } catch (Throwable ignored) {}
+                        }
+                    }
+                    try {
+                        txSock.send(new DatagramPacket(probeData, probeData.length,
+                                java.net.InetAddress.getByName("255.255.255.255"), CoopStreamServer.DISCOVERY_UDP_PORT));
+                    } catch (Throwable ignored) {}
+
+                    byte[] buf = new byte[256];
+                    DatagramPacket pkt = new DatagramPacket(buf, buf.length);
+                    long deadline = System.currentTimeMillis() + 3000L;
+                    while (found.get() == null && System.currentTimeMillis() < deadline) {
+                        // First check unicast reply on txSock (arrives in ~2ms even when rx broadcasts are blocked!)
+                        try {
+                            txSock.receive(pkt);
+                            String msg = new String(pkt.getData(), 0, pkt.getLength(), "UTF-8").trim();
+                            if (msg.startsWith("LMCOOP1|")) {
+                                String rip = (pkt.getAddress() != null) ? pkt.getAddress().getHostAddress() : null;
+                                if (rip != null && !myIps.contains(rip) && !"127.0.0.1".equals(rip)) {
+                                    found.compareAndSet(null, rip);
+                                    break;
+                                }
+                            }
+                        } catch (java.net.SocketTimeoutException ignored) {
+                        } catch (Throwable ignored) {
+                        }
+
+                        // Then check passive broadcast beacon on :31160
+                        try {
+                            rxSock.receive(pkt);
+                            String msg = new String(pkt.getData(), 0, pkt.getLength(), "UTF-8").trim();
+                            if (msg.startsWith("LMCOOP1|")) {
+                                String senderIp = (pkt.getAddress() != null) ? pkt.getAddress().getHostAddress() : null;
+                                String[] parts = msg.split("\\|");
+                                String cand = (senderIp != null && !senderIp.isEmpty() && !"127.0.0.1".equals(senderIp))
+                                        ? senderIp : ((parts.length >= 2) ? parts[1].trim() : null);
+                                if (cand != null && !cand.isEmpty() && !myIps.contains(cand)) {
+                                    found.compareAndSet(null, cand);
+                                    break;
+                                }
+                            }
+                        } catch (java.net.SocketTimeoutException ignored) {
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    if (rxSock != null) try { rxSock.close(); } catch (Throwable ignored) {}
+                    if (txSock != null) try { txSock.close(); } catch (Throwable ignored) {}
+                }
+            }, "coop-discover-udp");
+            udpThread.start();
+
+            // Thread pool: parallel TCP :31161 "PRBE" scan across local /24 LAN subnet(s)
+            // Works even on Wi-Fi routers / Hotspots that completely block UDP broadcasts!
+            java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(32);
+            try {
+                java.util.LinkedHashSet<String> prefixes = new java.util.LinkedHashSet<>();
+                for (CoopStreamServer.LanEndpoint ep : myEps) {
+                    int dot = ep.ip.lastIndexOf('.');
+                    if (dot > 0) prefixes.add(ep.ip.substring(0, dot + 1));
+                }
+                // Check gateway .1 and last-used host IP first (instant hit on Hotspot!)
+                String prevIp = (coopHostIpEdit != null) ? coopHostIpEdit.getText().toString().trim() : "";
+                List<String> targets = new ArrayList<>();
+                if (!prevIp.isEmpty() && CoopStreamServer.isPrivateLanIpv4(prevIp) && !myIps.contains(prevIp)) {
+                    targets.add(prevIp);
+                }
+                for (String pref : prefixes) {
+                    String gw = pref + "1";
+                    if (!myIps.contains(gw) && !targets.contains(gw)) targets.add(gw);
+                }
+                for (String pref : prefixes) {
+                    for (int host = 2; host <= 254; host++) {
+                        String cand = pref + host;
+                        if (!myIps.contains(cand) && !targets.contains(cand)) targets.add(cand);
+                    }
+                }
+
+                // Determine which /24 prefix belongs to TRANSPORT_WIFI so each IP is probed only once
+                String wifiPrefix = null;
+                if (wifiNet != null) {
+                    try {
+                        android.net.ConnectivityManager cm = (android.net.ConnectivityManager)
+                                getSystemService(android.content.Context.CONNECTIVITY_SERVICE);
+                        android.net.LinkProperties wlp = (cm != null) ? cm.getLinkProperties(wifiNet) : null;
+                        if (wlp != null) {
+                            for (android.net.LinkAddress la : wlp.getLinkAddresses()) {
+                                java.net.InetAddress a = la.getAddress();
+                                if (a instanceof java.net.Inet4Address && !a.isLoopbackAddress()) {
+                                    String wip = a.getHostAddress();
+                                    int dot = (wip != null) ? wip.lastIndexOf('.') : -1;
+                                    if (dot > 0) { wifiPrefix = wip.substring(0, dot + 1); break; }
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+                final String fWifiPrefix = wifiPrefix;
+
+                for (final String cand : targets) {
+                    if (found.get() != null) break;
+                    pool.execute(() -> {
+                        if (found.get() != null) return;
+                        android.net.Network useNet = (wifiNet != null && fWifiPrefix != null && cand.startsWith(fWifiPrefix))
+                                ? wifiNet : null;
+                        String hit = probeTcpCoopHost(cand, useNet);
+                        if (hit != null) {
+                            found.compareAndSet(null, hit);
+                        }
+                    });
+                }
+                pool.shutdown();
+                long waitEnd = System.currentTimeMillis() + 3400L;
+                while (found.get() == null && !pool.isTerminated() && System.currentTimeMillis() < waitEnd) {
+                    try { Thread.sleep(80); } catch (InterruptedException ignored) {}
+                }
+            } finally {
+                pool.shutdownNow();
+                try { udpThread.join(400); } catch (InterruptedException ignored) {}
+                CoopStreamServer.releaseMulticastLock(mlock);
+                discoveringHost = false;
+            }
+
+            final String resultIp = found.get();
+            final String mySummary = CoopStreamServer.getLocalIpv4Summary(this);
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                if (resultIp != null) {
+                    if (coopHostIpEdit != null) coopHostIpEdit.setText(resultIp);
+                    saveSettingsFromUi();
+                    Toast.makeText(this, "Host ditemukan: " + resultIp, Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(this,
+                            "Host tidak ditemukan (IP HP ini: " + mySummary
+                                    + "). Pastikan HP 1 sudah masuk game & Mode Co-op ON. Jika router pakai AP Isolation, nyalakan Hotspot di HP 1 lalu sambungkan HP 2 ke Hotspot HP 1.",
+                            Toast.LENGTH_LONG).show();
+                }
+            });
+        }, "coop-discover").start();
+    }
+
+    private void testOrDiscoverCoop() {
+        String netMode = coopNetModeValues[coopNetModeSpinner.getSelectedItemPosition()];
+        if ("lan".equals(netMode)) {
+            discoverCoopHost();
+            return;
+        }
+        String srv = (coopHostIpEdit != null) ? coopHostIpEdit.getText().toString().trim() : "";
+        String port = (coopRelayPortEdit != null) ? coopRelayPortEdit.getText().toString().trim() : "31161";
+        if (srv.isEmpty()) {
+            Toast.makeText(this, "Isi Alamat Server Online terlebih dahulu (contoh: lego-coop.onrender.com)", Toast.LENGTH_LONG).show();
+            return;
+        }
+        saveSettingsFromUi();
+        Toast.makeText(this, "Mengecek server " + srv + " ...", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            String result;
+            try {
+                result = "✅ Server " + CoopRelayLink.testServerHealth(srv, port);
+            } catch (Throwable t) {
+                result = "❌ Gagal kontak server: " + (t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName());
+            }
+            final String msg = result;
+            runOnUiThread(() -> {
+                if (!isFinishing() && !isDestroyed()) {
+                    Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+                }
+            });
+        }, "coop-test-srv").start();
+    }
+
+    private void launchCoopClient() {
+        String netMode = coopNetModeValues[coopNetModeSpinner.getSelectedItemPosition()];
+        String hostIp = (coopHostIpEdit != null) ? coopHostIpEdit.getText().toString().trim() : "";
+        String relayPort = (coopRelayPortEdit != null) ? coopRelayPortEdit.getText().toString().trim() : "31161";
+        if (relayPort.isEmpty()) relayPort = "31161";
+        String relayPass = (coopRelayPassEdit != null) ? coopRelayPassEdit.getText().toString() : "";
+
+        if (hostIp.isEmpty()) {
+            Toast.makeText(this,
+                    "relay".equals(netMode)
+                            ? "Masukkan Alamat Server Online terlebih dahulu!"
+                            : "Masukkan IP HP 1 (Host) terlebih dahulu atau klik Cari LAN",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        saveSettingsFromUi();
+        Intent intent = new Intent(this, CoopClientActivity.class);
+        intent.putExtra("coop_net_mode", netMode);
+        intent.putExtra("host_ip", hostIp);
+        intent.putExtra("relay_port", relayPort);
+        intent.putExtra("relay_pass", relayPass);
+        intent.putExtra("coop_audio", swCoopAudio == null || swCoopAudio.isChecked());
+        intent.putExtra("touch_controls", swTouch.isChecked());
+        intent.putExtra("gamepad_autohide", swGamepadAutohide.isChecked());
+        intent.putExtra("gamepad_layout", gamepadLayoutValues[gamepadLayoutSpinner.getSelectedItemPosition()]);
+        startActivity(intent);
+    }
+
     private void launchGame() {
         boolean hasNativeObb = findObbInDir(getObbDir()) != null;
         if (!hasStoragePermission() && !hasNativeObb) {
@@ -1011,10 +1499,29 @@ public class LauncherActivity extends Activity {
             Toast.makeText(this, "File OBB tidak ditemukan! Taruh main.2.com.ps3recomp.legomarvel.obb di Android/obb/com.ps3recomp.legomarvel/", Toast.LENGTH_LONG).show();
             return;
         }
+        String coopMode = coopModeValues[coopModeSpinner.getSelectedItemPosition()];
+        String netMode = coopNetModeValues[coopNetModeSpinner.getSelectedItemPosition()];
+        String hostIp = (coopHostIpEdit != null) ? coopHostIpEdit.getText().toString().trim() : "";
+        String relayPort = (coopRelayPortEdit != null) ? coopRelayPortEdit.getText().toString().trim() : "31161";
+        if (relayPort.isEmpty()) relayPort = "31161";
+        String relayPass = (coopRelayPassEdit != null) ? coopRelayPassEdit.getText().toString() : "";
+
+        if (!"off".equals(coopMode) && "relay".equals(netMode) && hostIp.isEmpty()) {
+            Toast.makeText(this, "Mode Server Online aktif — isi Alamat Server Online terlebih dahulu!", Toast.LENGTH_LONG).show();
+            return;
+        }
+
         saveSettingsFromUi();
         Intent intent = new Intent(this, GameActivity.class);
         intent.putExtra("touch_controls", swTouch.isChecked());
         intent.putExtra("show_fps", swShowFps.isChecked());
+        intent.putExtra("coop_mode", coopMode);
+        intent.putExtra("coop_net_mode", netMode);
+        intent.putExtra("coop_host_ip", hostIp);
+        intent.putExtra("coop_relay_port", relayPort);
+        intent.putExtra("coop_relay_pass", relayPass);
+        intent.putExtra("coop_quality", coopQualityValues[coopQualitySpinner.getSelectedItemPosition()]);
+        intent.putExtra("coop_audio", swCoopAudio == null || swCoopAudio.isChecked());
         startActivity(intent);
     }
 

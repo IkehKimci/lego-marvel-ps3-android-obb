@@ -15,9 +15,15 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <mutex>
 #include <unistd.h>
 
+static std::recursive_mutex g_lego_music_list_mtx;
+
 extern "C" {
+void lego_music_list_lock(void)   { g_lego_music_list_mtx.lock(); }
+void lego_music_list_unlock(void) { g_lego_music_list_mtx.unlock(); }
+
 extern uint8_t* vm_base;
 void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 uint32_t vm_read32(uint64_t a);

@@ -28,7 +28,11 @@
 #include <pthread.h>
 #include <signal.h>
 #include <string>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -111,6 +115,8 @@ struct AndroidLauncherSettings {
     int low_end_mode        = 0;    /* 1 = aggressive low-end CPU/GPU/RAM mode */
     int gamepad_autohide    = 1;    /* 1 = auto-hide touch overlay when physical pad active */
     int gamepad_nintendo    = 0;    /* 1 = swap A<->B and X<->Y for Switch/Nintendo pads */
+    int coop_mode           = 0;    /* 0=off, 1=auto split, 2=force L|R split, 3=mirror */
+    int coop_aspect         = 0;    /* 0=balanced, 1=fill, 2=fit */
     std::string scaling_mode = "fsr";   /* "fsr", "cas", "integer", "linear" */
     std::string frame_gen    = "off";   /* "off", "flow", "blend" */
     std::string driver_mode = "system"; /* "system" or "custom" */
@@ -159,6 +165,7 @@ static void load_android_settings(const char* internal_dir)
         setenv("PS3RECOMP_VK_SCALING", g_settings.scaling_mode.c_str(), 1);
         setenv("PS3RECOMP_VK_FRAME_GEN", g_settings.frame_gen.c_str(), 1);
         unsetenv("PS3RECOMP_ENG_LOW_END");
+        rsx_vulkan_backend_coop_configure(0, 0);
         fprintf(stderr, "[settings] no settings.ini found; using defaults (720p, 60fps, fsr, fg=off, system Vulkan)\n");
         return;
     }
@@ -210,6 +217,15 @@ static void load_android_settings(const char* internal_dir)
             g_settings.gamepad_autohide = (v == "0") ? 0 : 1;
         } else if (k == "gamepad_layout") {
             g_settings.gamepad_nintendo = (v == "nintendo") ? 1 : 0;
+        } else if (k == "coop_mode") {
+            if (v == "auto" || v == "1")        g_settings.coop_mode = 1;
+            else if (v == "split" || v == "2")  g_settings.coop_mode = 2;
+            else if (v == "mirror" || v == "3") g_settings.coop_mode = 3;
+            else                                g_settings.coop_mode = 0;
+        } else if (k == "coop_aspect") {
+            if (v == "fill" || v == "1")        g_settings.coop_aspect = 1;
+            else if (v == "fit" || v == "2")    g_settings.coop_aspect = 2;
+            else                                g_settings.coop_aspect = 0;
         } else if (k == "guest_shaders") {
             setenv("PS3RECOMP_VK_GUEST_PROGRAMS", (v == "0") ? "0" : "1", 1);
         } else if (k == "direct_present") {
@@ -242,6 +258,7 @@ static void load_android_settings(const char* internal_dir)
     fclose(f);
     setenv("PS3RECOMP_VK_SCALING", g_settings.scaling_mode.c_str(), 1);
     setenv("PS3RECOMP_VK_FRAME_GEN", g_settings.frame_gen.c_str(), 1);
+    rsx_vulkan_backend_coop_configure(g_settings.coop_mode, g_settings.coop_aspect);
     if (g_settings.low_end_mode) {
         setenv("PS3RECOMP_ENG_LOW_END", "1", 1);
         setenv("PS3RECOMP_ENG_FEEDBACK_PER_PASS", "1", 1);
@@ -250,10 +267,10 @@ static void load_android_settings(const char* internal_dir)
     }
 
     fprintf(stderr,
-            "[settings] loaded %s: %dx%d fps_limit=%d scaling=%s fg=%s low_end=%d driver=%s(%s) turbo=%d touch=%d pad_autohide=%d pad_nint=%d fps_hud=%d\n",
+            "[settings] loaded %s: %dx%d fps_limit=%d scaling=%s fg=%s low_end=%d coop=%d(aspect=%d) driver=%s(%s) turbo=%d touch=%d pad_autohide=%d pad_nint=%d fps_hud=%d\n",
             loaded_from.c_str(), g_settings.render_width, g_settings.render_height,
             g_settings.fps_limit, g_settings.scaling_mode.c_str(), g_settings.frame_gen.c_str(),
-            g_settings.low_end_mode,
+            g_settings.low_end_mode, g_settings.coop_mode, g_settings.coop_aspect,
             g_settings.driver_mode.c_str(),
             g_settings.driver_name.c_str(), g_settings.adreno_turbo,
             g_settings.touch_controls, g_settings.gamepad_autohide,
@@ -335,6 +352,8 @@ static std::atomic<uint64_t> s_vpad_visual_state{
 };
 static std::atomic<int> s_hw_pad_count{0};
 static std::atomic<int> s_hw_pad_active{0};
+static std::atomic<int> s_coop_client_connected{0};
+static std::atomic<int> s_coop_p2_udp_active{0};
 
 #if PS3_ANDROID_APK
 extern "C" JNIEXPORT jlong JNICALL __attribute__((visibility("default")))
@@ -373,6 +392,125 @@ extern "C" JNIEXPORT jlong JNICALL __attribute__((visibility("default")))
 Java_com_ps3recomp_legomarvel_GameActivity_nativeGetVirtualPadState(JNIEnv*, jclass)
 {
     return (jlong)s_vpad_visual_state.load(std::memory_order_relaxed);
+}
+
+extern "C" JNIEXPORT void JNICALL __attribute__((visibility("default")))
+Java_com_ps3recomp_legomarvel_GameActivity_nativeCoopSetClientConnected(JNIEnv*, jclass, jint connected)
+{
+    const int v = connected ? 1 : 0;
+    s_coop_client_connected.store(v, std::memory_order_release);
+    rsx_vulkan_backend_coop_set_client_connected(v);
+}
+
+extern "C" JNIEXPORT void JNICALL __attribute__((visibility("default")))
+Java_com_ps3recomp_legomarvel_GameActivity_nativeCoopSetMode(JNIEnv*, jclass, jint mode, jint aspect)
+{
+    g_settings.coop_mode = (int)mode;
+    g_settings.coop_aspect = (int)aspect;
+    rsx_vulkan_backend_coop_configure((int)mode, (int)aspect);
+}
+
+extern "C" JNIEXPORT jint JNICALL __attribute__((visibility("default")))
+Java_com_ps3recomp_legomarvel_GameActivity_nativeCoopGetStatus(JNIEnv*, jclass)
+{
+    const int mode   = rsx_vulkan_backend_coop_get_mode() & 0xF;
+    const int split  = rsx_vulkan_backend_coop_is_split_active() ? 1 : 0;
+    const int client = s_coop_client_connected.load(std::memory_order_relaxed) ? 1 : 0;
+    const int udp    = s_coop_p2_udp_active.load(std::memory_order_relaxed) ? 1 : 0;
+    return (jint)(mode | (split << 4) | (client << 8) | (udp << 9));
+}
+
+extern "C" JNIEXPORT jint JNICALL __attribute__((visibility("default")))
+Java_com_ps3recomp_legomarvel_GameActivity_nativeCoopFillYuvPlanes(
+    JNIEnv* env, jclass,
+    jobject yBuf, jint yStride,
+    jobject uBuf, jint uStride,
+    jobject vBuf, jint vStride,
+    jint uvPixelStride,
+    jintArray outMeta, jint timeoutMs)
+{
+    if (!yBuf || !uBuf || !vBuf || uvPixelStride <= 0) return -1;
+    u8* yp = (u8*)env->GetDirectBufferAddress(yBuf);
+    u8* up = (u8*)env->GetDirectBufferAddress(uBuf);
+    u8* vp = (u8*)env->GetDirectBufferAddress(vBuf);
+    if (!yp || !up || !vp) return -1;
+    u32 w = 0, h = 0;
+    int split = 0;
+    int rc = rsx_vulkan_backend_coop_fill_yuv(
+        yp, (u32)yStride, up, (u32)uStride, vp, (u32)vStride,
+        (u32)uvPixelStride, &w, &h, &split, (u32)(timeoutMs > 0 ? timeoutMs : 100));
+    if (rc > 0 && outMeta && env->GetArrayLength(outMeta) >= 3) {
+        jint meta[3] = { (jint)w, (jint)h, (jint)split };
+        env->SetIntArrayRegion(outMeta, 0, 3, meta);
+    }
+    return (jint)rc;
+}
+
+extern "C" JNIEXPORT jint JNICALL __attribute__((visibility("default")))
+Java_com_ps3recomp_legomarvel_GameActivity_nativeCoopFillRgba(
+    JNIEnv* env, jclass,
+    jobject rgbaBuf, jintArray outMeta, jint timeoutMs)
+{
+    if (!rgbaBuf) return -1;
+    u8* ptr = (u8*)env->GetDirectBufferAddress(rgbaBuf);
+    jlong cap = env->GetDirectBufferCapacity(rgbaBuf);
+    if (!ptr || cap <= 0) return -1;
+    u32 w = 0, h = 0;
+    int split = 0;
+    int rc = rsx_vulkan_backend_coop_fill_rgba(
+        ptr, (u32)cap, &w, &h, &split, (u32)(timeoutMs > 0 ? timeoutMs : 100));
+    if (rc > 0 && outMeta && env->GetArrayLength(outMeta) >= 3) {
+        jint meta[3] = { (jint)w, (jint)h, (jint)split };
+        env->SetIntArrayRegion(outMeta, 0, 3, meta);
+    }
+    return (jint)rc;
+}
+extern "C" {
+void     cellAudio_coop_set_enabled(int enabled);
+uint32_t cellAudio_coop_read_adpcm(uint8_t* out_buf, uint32_t max_bytes, uint32_t* out_frames);
+}
+
+extern "C" JNIEXPORT void JNICALL __attribute__((visibility("default")))
+Java_com_ps3recomp_legomarvel_GameActivity_nativeCoopPushP2Input(
+    JNIEnv*, jclass,
+    jint btns, jint lx, jint ly, jint rx, jint ry, jint l2, jint r2)
+{
+    if (btns < 0) {
+        /* Client disconnected: release all P2 inputs cleanly */
+        s_coop_p2_udp_active.store(0, std::memory_order_release);
+        cellPad_android_set_buttons_mask(1, 0);
+        cellPad_android_set_sticks(1, 128, 128, 128, 128);
+        cellPad_android_set_triggers(1, 0, 0);
+        return;
+    }
+    cellPad_android_set_connected(1, 1);
+    s_coop_p2_udp_active.store(1, std::memory_order_release);
+    cellPad_android_set_buttons_mask(1, (u16)(btns & 0xFFFF));
+    cellPad_android_set_sticks(1, (u8)(lx & 0xFF), (u8)(ly & 0xFF),
+                               (u8)(rx & 0xFF), (u8)(ry & 0xFF));
+    cellPad_android_set_triggers(1, (u8)(l2 & 0xFF), (u8)(r2 & 0xFF));
+}
+
+extern "C" JNIEXPORT void JNICALL __attribute__((visibility("default")))
+Java_com_ps3recomp_legomarvel_GameActivity_nativeCoopSetAudioEnabled(JNIEnv*, jclass, jint enabled)
+{
+    cellAudio_coop_set_enabled(enabled ? 1 : 0);
+}
+
+extern "C" JNIEXPORT jint JNICALL __attribute__((visibility("default")))
+Java_com_ps3recomp_legomarvel_GameActivity_nativeCoopReadAudioAdpcm(JNIEnv* env, jclass, jbyteArray outBuf)
+{
+    if (!outBuf) return 0;
+    jsize cap = env->GetArrayLength(outBuf);
+    if (cap < 520) return 0;
+    uint8_t tmp[544];
+    uint32_t frames = 0;
+    uint32_t n = cellAudio_coop_read_adpcm(tmp, (uint32_t)sizeof(tmp), &frames);
+    if (n > 0 && (jsize)n <= cap) {
+        env->SetByteArrayRegion(outBuf, 0, (jsize)n, (const jbyte*)tmp);
+        return (jint)n;
+    }
+    return 0;
 }
 #endif
 
@@ -1196,6 +1334,7 @@ static u8 axis_to_u8_raw(float v)
 static void eval_hw_stick(float x, float y, u8* out_x, u8* out_y)
 {
     const float dz = 0.08f;
+    const float outer = 0.88f;
     float len = sqrtf(x * x + y * y);
     if (len <= dz) {
         *out_x = 128;
@@ -1204,10 +1343,18 @@ static void eval_hw_stick(float x, float y, u8* out_x, u8* out_y)
     }
     float ux = x / len;
     float uy = y / len;
-    float mag = (len - dz) / (1.0f - dz);
+    float mag = (len - dz) / (outer - dz);
     if (mag > 1.0f) mag = 1.0f;
-    *out_x = axis_to_u8_raw(ux * mag);
-    *out_y = axis_to_u8_raw(uy * mag);
+    /* DualShock 3 square outer-gate projection: modern circular-gate pads
+     * (PS4/PS5/Xbox/Switch/Gamesir) cap diagonal axes near (+/-0.707, +/-0.707)
+     * or lower, which PS3 games with per-axis deadzones read as slow walking.
+     * Smoothly project circular full-tilt input onto the [-1, 1]^2 PS3 square
+     * gate while preserving exact direction and smooth low-tilt walk control. */
+    float dom = fmaxf(fabsf(ux), fabsf(uy));
+    float sq = (dom > 1e-4f) ? (1.0f / dom) : 1.0f;
+    float scale = mag * (1.0f + (sq - 1.0f) * mag);
+    *out_x = axis_to_u8_raw(ux * scale);
+    *out_y = axis_to_u8_raw(uy * scale);
 }
 
 static inline float clamp01(float v)
@@ -1692,9 +1839,121 @@ static void on_input_queue_destroyed(ANativeActivity* act, AInputQueue* queue)
     AInputQueue_detachLooper(queue);
 }
 
+/* ---------------------------------------------------------------------------
+ * 2-Phone Wi-Fi Co-op UDP Player 2 Input Server (port 31162)
+ *
+ * Receives 16-byte LMP2 packets from Phone 2 (CoopClientActivity) and feeds
+ * buttons, sticks, and triggers directly into cellPad Port 1 (Player 2).
+ * -------------------------------------------------------------------------*/
+static constexpr uint16_t kCoopInputUdpPort = 31162;
+static std::atomic<int>   s_coop_udp_stop{0};
+static std::atomic<int>   s_coop_udp_started{0};
+static pthread_t          s_coop_udp_thread{};
+
+static void* coop_udp_input_thread(void*)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "[coop-udp] socket() failed: errno=%d\n", errno);
+        return nullptr;
+    }
+    int reuse = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    struct timeval tv{};
+    tv.tv_sec = 0;
+    tv.tv_usec = 250000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(kCoopInputUdpPort);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "[coop-udp] bind(:%u) failed: errno=%d\n",
+                (unsigned)kCoopInputUdpPort, errno);
+        close(fd);
+        return nullptr;
+    }
+    fprintf(stderr, "[coop-udp] listening for Player 2 input on UDP :%u\n",
+            (unsigned)kCoopInputUdpPort);
+    fflush(stderr);
+
+    uint32_t last_seq = 0;
+    bool have_seq = false;
+    bool connected = false;
+    uint64_t last_pkt_ns = 0;
+    uint8_t pkt[32];
+
+    while (!s_coop_udp_stop.load(std::memory_order_acquire)) {
+        ssize_t n = recvfrom(fd, pkt, sizeof(pkt), 0, nullptr, nullptr);
+        const uint64_t now_ns = monotonic_ns();
+        if (n >= 16 && pkt[0] == 'L' && pkt[1] == 'M' && pkt[2] == 'P' && pkt[3] == '2') {
+            uint32_t seq = (uint32_t)pkt[4]
+                         | ((uint32_t)pkt[5] << 8)
+                         | ((uint32_t)pkt[6] << 16)
+                         | ((uint32_t)pkt[7] << 24);
+            /* Accept wraparound or fresh client restart (seq == 0 or seq < 4). */
+            if (!have_seq || seq <= 3u || (int32_t)(seq - last_seq) >= 0) {
+                last_seq = seq;
+                have_seq = true;
+                last_pkt_ns = now_ns;
+                if (!connected) {
+                    connected = true;
+                    cellPad_android_set_connected(1, 1);
+                    s_coop_p2_udp_active.store(1, std::memory_order_release);
+                    fprintf(stderr, "[coop-udp] Phone 2 (Player 2) connected!\n");
+                    fflush(stderr);
+                }
+                uint16_t btns = (uint16_t)pkt[8] | ((uint16_t)pkt[9] << 8);
+                u8 lx = pkt[10], ly = pkt[11], rx = pkt[12], ry = pkt[13];
+                u8 l2 = pkt[14], r2 = pkt[15];
+                cellPad_android_set_buttons_mask(1, btns);
+                cellPad_android_set_sticks(1, lx, ly, rx, ry);
+                cellPad_android_set_triggers(1, l2, r2);
+            }
+        } else if (connected && last_pkt_ns > 0 && (now_ns - last_pkt_ns) > 3000000000ull) {
+            /* Client timed out for >3s: zero Player 2 inputs so character never gets stuck. */
+            connected = false;
+            have_seq = false;
+            s_coop_p2_udp_active.store(0, std::memory_order_release);
+            cellPad_android_set_buttons_mask(1, 0);
+            cellPad_android_set_sticks(1, 128, 128, 128, 128);
+            cellPad_android_set_triggers(1, 0, 0);
+            fprintf(stderr, "[coop-udp] Phone 2 heartbeat timeout; P2 inputs reset\n");
+            fflush(stderr);
+        }
+    }
+    if (connected) {
+        cellPad_android_set_buttons_mask(1, 0);
+        cellPad_android_set_sticks(1, 128, 128, 128, 128);
+        cellPad_android_set_triggers(1, 0, 0);
+    }
+    s_coop_p2_udp_active.store(0, std::memory_order_release);
+    close(fd);
+    return nullptr;
+}
+
+static void start_coop_udp_input_server(void)
+{
+    if (s_coop_udp_started.exchange(1) != 0) return;
+    s_coop_udp_stop.store(0, std::memory_order_release);
+    if (pthread_create(&s_coop_udp_thread, nullptr, coop_udp_input_thread, nullptr) != 0) {
+        s_coop_udp_started.store(0, std::memory_order_release);
+    }
+}
+
+static void stop_coop_udp_input_server(void)
+{
+    if (s_coop_udp_started.exchange(0) == 0) return;
+    s_coop_udp_stop.store(1, std::memory_order_release);
+    pthread_detach(s_coop_udp_thread);
+}
+
 static void on_destroy(ANativeActivity* act)
 {
     (void)act;
+    stop_coop_udp_input_server();
+    rsx_vulkan_backend_coop_set_client_connected(0);
     g_quit_requested.store(1, std::memory_order_release);
     rsx_vulkan_android_request_quit();
     if (s_ctx && s_ctx->started.load()) {
@@ -1727,6 +1986,10 @@ void ANativeActivity_onCreate(ANativeActivity* activity, void* savedState, size_
     g_fallback_int_dir  = s_ctx->internal_dir;
     g_fallback_ext_dir  = s_ctx->external_dir;
     g_quit_requested.store(0, std::memory_order_release);
+
+    if (g_settings.coop_mode != 0) {
+        start_coop_udp_input_server();
+    }
 
     activity->callbacks->onNativeWindowCreated  = on_window_created;
     activity->callbacks->onNativeWindowResized  = on_window_resized;
