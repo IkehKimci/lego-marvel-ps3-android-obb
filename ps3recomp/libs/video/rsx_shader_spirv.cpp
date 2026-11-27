@@ -244,28 +244,48 @@ extern "C" int rsx_hlsl_to_spirv(const char* hlsl, int stage,
         return -1;
     }
 
-    /* One lock around the whole lookup and translation: glslang's process
-     * state is not documented as thread-safe either. */
+    /* Split map/stats lock from glslang's translation lock and perform disk
+     * cache I/O unlocked so async pipeline compiler workers can hit memory and
+     * disk caches concurrently while another worker runs glslang. */
+    static std::mutex s_glslang_lock;
     Cache& c = cache();
-    std::lock_guard<std::mutex> guard(c.lock);
     const std::string key = cache_key(hlsl, stage);
-    auto it = c.map.find(key);
-    if (it != c.map.end()) {
-        c.stats.memory_hits++;
-    } else {
-        std::vector<unsigned int> spirv;
-        const std::string& dir = cache_dir(c);
-        const std::string path = dir.empty() ? std::string() : cache_path(dir, key);
-        if (!dir.empty() && cache_load(path, key, spirv)) {
-            c.stats.disk_hits++;
+    std::string dir;
+    std::vector<unsigned int> spirv;
+    bool from_mem = false;
+    {
+        std::lock_guard<std::mutex> guard(c.lock);
+        auto it = c.map.find(key);
+        if (it != c.map.end()) {
+            c.stats.memory_hits++;
+            const std::vector<unsigned int>& cached = it->second;
+            if (cached.size() > max_words) {
+                char n[64];
+                snprintf(n, sizeof n, "%zu words, room for %u", cached.size(), max_words);
+                put_log(log, log_size, "SPIR-V output too large", n);
+                return -1;
+            }
+            memcpy(words, cached.data(), cached.size() * sizeof(u32));
+            *out_words = (u32)cached.size();
+            from_mem = true;
         } else {
-            if (translate(hlsl, stage, spirv, log, log_size)) return -1;
-            c.stats.translations++;
-            if (!dir.empty()) cache_store(path, key, spirv);
+            dir = cache_dir(c);
         }
-        it = c.map.emplace(key, std::move(spirv)).first;
     }
-    const std::vector<unsigned int>& spirv = it->second;
+    if (from_mem) return 0;
+
+    const std::string path = dir.empty() ? std::string() : cache_path(dir, key);
+    bool disk_hit = false;
+    if (!dir.empty() && cache_load(path, key, spirv)) {
+        disk_hit = true;
+    } else {
+        {
+            std::lock_guard<std::mutex> tguard(s_glslang_lock);
+            if (translate(hlsl, stage, spirv, log, log_size)) return -1;
+        }
+        if (!dir.empty()) cache_store(path, key, spirv);
+    }
+
     if (spirv.size() > max_words) {
         char n[64];
         snprintf(n, sizeof n, "%zu words, room for %u", spirv.size(), max_words);
@@ -274,6 +294,13 @@ extern "C" int rsx_hlsl_to_spirv(const char* hlsl, int stage,
     }
     memcpy(words, spirv.data(), spirv.size() * sizeof(u32));
     *out_words = (u32)spirv.size();
+
+    {
+        std::lock_guard<std::mutex> guard(c.lock);
+        if (disk_hit) c.stats.disk_hits++;
+        else          c.stats.translations++;
+        c.map.emplace(key, std::move(spirv));
+    }
     return 0;
 }
 

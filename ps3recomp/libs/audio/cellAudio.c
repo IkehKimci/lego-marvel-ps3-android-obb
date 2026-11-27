@@ -252,10 +252,12 @@ static u32 audio_backend_queued_samples(void)
 #if AUDIO_BACKEND_AAUDIO
 
 /* Lock-free single-producer / single-consumer stereo float ring buffer.
- * Power-of-two capacity: 16384 stereo frames (~341.3 ms at 48 kHz, 64 PS3 blocks). */
-#define AAUDIO_RING_FRAMES 16384u
-#define AAUDIO_RING_MASK   (AAUDIO_RING_FRAMES - 1u)
-#define AAUDIO_PREFILL_FRAMES (CELL_AUDIO_BLOCK_SAMPLES * 8u)
+ * Power-of-two capacity: 32768 stereo frames (~682.7 ms at 48 kHz, 128 PS3 blocks).
+ * Prefill sits at 16 blocks (85.3 ms), squarely midway between LO=10 and HI=24 so
+ * 10-20 ms AudioFlinger bursts never trip < LO catch-up bursts. */
+#define AAUDIO_RING_FRAMES    32768u
+#define AAUDIO_RING_MASK      (AAUDIO_RING_FRAMES - 1u)
+#define AAUDIO_PREFILL_FRAMES (CELL_AUDIO_BLOCK_SAMPLES * 16u)
 
 typedef aaudio_result_t (*pfn_AAudio_createStreamBuilder)(AAudioStreamBuilder**);
 typedef void            (*pfn_AAudioStreamBuilder_setDirection)(AAudioStreamBuilder*, aaudio_direction_t);
@@ -270,6 +272,9 @@ typedef aaudio_result_t (*pfn_AAudioStreamBuilder_delete)(AAudioStreamBuilder*);
 typedef aaudio_result_t (*pfn_AAudioStream_requestStart)(AAudioStream*);
 typedef aaudio_result_t (*pfn_AAudioStream_requestStop)(AAudioStream*);
 typedef aaudio_result_t (*pfn_AAudioStream_close)(AAudioStream*);
+typedef int32_t         (*pfn_AAudioStream_getFramesPerBurst)(AAudioStream*);
+typedef int32_t         (*pfn_AAudioStream_getBufferCapacityInFrames)(AAudioStream*);
+typedef aaudio_result_t (*pfn_AAudioStream_setBufferSizeInFrames)(AAudioStream*, int32_t);
 
 static void*         s_aa_lib    = NULL;
 static AAudioStream* s_aa_stream = NULL;
@@ -279,6 +284,7 @@ static pfn_AAudioStream_close       p_aa_close = NULL;
 static float         s_aa_ring[AAUDIO_RING_FRAMES * 2u];
 static volatile u32  s_aa_read_pos  = 0;
 static volatile u32  s_aa_write_pos = 0;
+static volatile u32  s_aa_underruns = 0;
 static float         s_aa_last_l    = 0.0f;
 static float         s_aa_last_r    = 0.0f;
 static u32           s_aa_fade_in   = 0;
@@ -306,7 +312,7 @@ static aaudio_data_callback_result_t aaudio_data_cb(
         float sl = s_aa_ring[idx * 2u + 0u];
         float sr = s_aa_ring[idx * 2u + 1u];
         if (fade_in > 0u) {
-            const float t = (float)(64u - fade_in) * (1.0f / 64.0f);
+            const float t = (float)(96u - fade_in) * (1.0f / 96.0f);
             sl = last_l + (sl - last_l) * t;
             sr = last_r + (sr - last_r) * t;
             fade_in--;
@@ -317,17 +323,18 @@ static aaudio_data_callback_result_t aaudio_data_cb(
         last_r = sr;
     }
     if (take < want) {
+        __atomic_add_fetch(&s_aa_underruns, 1u, __ATOMIC_RELAXED);
         /* Exponential decay instead of hard-zero step eliminates sharp clicks/pops
          * if a heavy scene stalls the SPU audio task past the jitter cushion. */
         for (u32 i = take; i < want; i++) {
-            last_l *= 0.960f;
-            last_r *= 0.960f;
+            last_l *= 0.965f;
+            last_r *= 0.965f;
             out[i * 2u + 0u] = last_l;
             out[i * 2u + 1u] = last_r;
         }
         if (last_l > -1e-6f && last_l < 1e-6f) last_l = 0.0f;
         if (last_r > -1e-6f && last_r < 1e-6f) last_r = 0.0f;
-        fade_in = 64u;
+        fade_in = 96u;
     }
     s_aa_last_l = last_l;
     s_aa_last_r = last_r;
@@ -339,7 +346,8 @@ static aaudio_data_callback_result_t aaudio_data_cb(
 static int audio_backend_init(void)
 {
     s_aa_read_pos = 0;
-    s_aa_write_pos = AAUDIO_PREFILL_FRAMES; /* start with 42.7 ms silence cushion */
+    s_aa_write_pos = AAUDIO_PREFILL_FRAMES; /* start with 85.3 ms silence cushion */
+    s_aa_underruns = 0;
     s_aa_last_l = 0.0f;
     s_aa_last_r = 0.0f;
     s_aa_fade_in = 0;
@@ -372,6 +380,13 @@ static int audio_backend_init(void)
     AA_SYM(close_stream,   AAudioStream_close);
 #undef AA_SYM
 
+    pfn_AAudioStream_getFramesPerBurst get_burst =
+        (pfn_AAudioStream_getFramesPerBurst)dlsym(s_aa_lib, "AAudioStream_getFramesPerBurst");
+    pfn_AAudioStream_getBufferCapacityInFrames get_cap =
+        (pfn_AAudioStream_getBufferCapacityInFrames)dlsym(s_aa_lib, "AAudioStream_getBufferCapacityInFrames");
+    pfn_AAudioStream_setBufferSizeInFrames set_buf =
+        (pfn_AAudioStream_setBufferSizeInFrames)dlsym(s_aa_lib, "AAudioStream_setBufferSizeInFrames");
+
     p_aa_stop  = req_stop;
     p_aa_close = close_stream;
 
@@ -399,6 +414,15 @@ static int audio_backend_init(void)
         return -1;
     }
 
+    int32_t burst = get_burst ? get_burst(s_aa_stream) : 0;
+    int32_t cap = get_cap ? get_cap(s_aa_stream) : 0;
+    int32_t tuned_buf = 0;
+    if (set_buf && burst > 0 && cap > 0) {
+        int32_t want_buf = burst * 4;
+        if (want_buf > cap) want_buf = cap;
+        if (want_buf > 0) tuned_buf = (int32_t)set_buf(s_aa_stream, want_buf);
+    }
+
     res = req_start(s_aa_stream);
     if (res != AAUDIO_OK) {
         printf("[cellAudio] AAudioStream_requestStart failed: %d\n", (int)res);
@@ -407,9 +431,10 @@ static int audio_backend_init(void)
         return -1;
     }
 
-    printf("[cellAudio] AAudio backend initialized (%d Hz stereo f32, ring=%u frames, cushion=%u ms)\n",
+    printf("[cellAudio] AAudio backend initialized (%d Hz stereo f32, ring=%u frames, cushion=%u ms, burst=%d buf=%d/%d)\n",
            CELL_AUDIO_SAMPLE_RATE, AAUDIO_RING_FRAMES,
-           (unsigned)((AAUDIO_PREFILL_FRAMES * 1000u) / CELL_AUDIO_SAMPLE_RATE));
+           (unsigned)((AAUDIO_PREFILL_FRAMES * 1000u) / CELL_AUDIO_SAMPLE_RATE),
+           burst, tuned_buf, cap);
     return 0;
 }
 
@@ -458,7 +483,7 @@ static u32 audio_backend_queued_samples(void)
 static int audio_backend_room(void)
 {
     if (!s_aa_stream) return -1;
-    return audio_backend_queued_samples() < CELL_AUDIO_BLOCK_SAMPLES * 16u
+    return audio_backend_queued_samples() < CELL_AUDIO_BLOCK_SAMPLES * AUDIO_PACE_QUEUE_HI_BLOCKS
          ? (int)CELL_AUDIO_BLOCK_SAMPLES : 0;
 }
 
@@ -781,11 +806,14 @@ static void audio_mix_one_block(void)
     mutex_unlock(&s_audio_mutex);
 
     /* Smooth C1 soft-limiter (linear up to +/-0.82, asymptotic knee to +/-0.985)
-     * plus NaN/Inf guard and guest-hole de-click smoothing. */
+     * plus NaN/Inf guard and 1-block mirrored Packet Loss Concealment (PLC). */
     {
+        static float s_mix_prev_block[CELL_AUDIO_BLOCK_SAMPLES * 2u];
         static float s_mix_prev_l = 0.0f;
         static float s_mix_prev_r = 0.0f;
-        static int   s_mix_was_hole = 0;
+        static u32   s_mix_hole_streak = 0;
+        static int   s_mix_was_active  = 0;
+        static u32   s_mix_holes_total = 0;
         float block_peak = 0.0f;
 
         for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2u; i++) {
@@ -805,35 +833,70 @@ static void audio_mix_one_block(void)
         }
 
         if (block_peak < 1e-6f) {
-            /* If the guest SPU missed this 5.33 ms block (all-zero hole right
-             * after active audio), smoothly decay the trailing sample over 64
-             * samples to eliminate digital step clicks/crackles. */
-            if (s_mix_prev_l > 1e-4f || s_mix_prev_l < -1e-4f ||
-                s_mix_prev_r > 1e-4f || s_mix_prev_r < -1e-4f) {
-                float pl = s_mix_prev_l, pr = s_mix_prev_r;
-                for (u32 s = 0; s < 64u && s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
-                    pl *= 0.92f;
-                    pr *= 0.92f;
-                    s_mix_buffer[s * 2u + 0u] = pl;
-                    s_mix_buffer[s * 2u + 1u] = pr;
+            if (s_mix_was_active) {
+                s_mix_hole_streak++;
+                if (s_mix_hole_streak == 1u) {
+                    /* First missed 5.33 ms guest block: replay the previous block
+                     * time-reversed (C0-continuous at the boundary) with a gentle
+                     * 0.90 -> 0.45 fade instead of dropping into 4 ms of silence. */
+                    s_mix_holes_total++;
+                    const float inv_n = 1.0f / (float)CELL_AUDIO_BLOCK_SAMPLES;
+                    for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
+                        const u32 rev = (CELL_AUDIO_BLOCK_SAMPLES - 1u) - s;
+                        const float g = 0.90f - 0.45f * ((float)s * inv_n);
+                        s_mix_buffer[s * 2u + 0u] = s_mix_prev_block[rev * 2u + 0u] * g;
+                        s_mix_buffer[s * 2u + 1u] = s_mix_prev_block[rev * 2u + 1u] * g;
+                    }
+                    s_mix_prev_l = s_mix_buffer[(CELL_AUDIO_BLOCK_SAMPLES - 1u) * 2u + 0u];
+                    s_mix_prev_r = s_mix_buffer[(CELL_AUDIO_BLOCK_SAMPLES - 1u) * 2u + 1u];
+                } else if (s_mix_hole_streak == 2u) {
+                    /* Second consecutive zero block: treat as genuine silence/pause
+                     * and smoothly decay the trailing sample to zero over 64 samples. */
+                    float pl = s_mix_prev_l, pr = s_mix_prev_r;
+                    for (u32 s = 0; s < 64u && s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
+                        pl *= 0.92f;
+                        pr *= 0.92f;
+                        s_mix_buffer[s * 2u + 0u] = pl;
+                        s_mix_buffer[s * 2u + 1u] = pr;
+                    }
+                    s_mix_prev_l = 0.0f;
+                    s_mix_prev_r = 0.0f;
+                    s_mix_was_active = 0;
                 }
-                s_mix_prev_l = 0.0f;
-                s_mix_prev_r = 0.0f;
-                s_mix_was_hole = 1;
             }
         } else {
-            if (s_mix_was_hole) {
-                /* 48-sample (1 ms) smooth fade-in when audio resumes after a hole. */
-                for (u32 s = 0; s < 48u && s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
-                    const float t = (float)(s + 1u) * (1.0f / 48.0f);
-                    s_mix_buffer[s * 2u + 0u] *= t;
-                    s_mix_buffer[s * 2u + 1u] *= t;
+            if (s_mix_hole_streak > 0u) {
+                /* 32-sample (0.67 ms) crossfade from PLC/decay tail into new block. */
+                const float pl = s_mix_prev_l, pr = s_mix_prev_r;
+                for (u32 s = 0; s < 32u && s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
+                    const float t = (float)(s + 1u) * (1.0f / 32.0f);
+                    s_mix_buffer[s * 2u + 0u] = pl + (s_mix_buffer[s * 2u + 0u] - pl) * t;
+                    s_mix_buffer[s * 2u + 1u] = pr + (s_mix_buffer[s * 2u + 1u] - pr) * t;
                 }
-                s_mix_was_hole = 0;
+                s_mix_hole_streak = 0;
             }
+            memcpy(s_mix_prev_block, s_mix_buffer, sizeof(s_mix_prev_block));
             s_mix_prev_l = s_mix_buffer[(CELL_AUDIO_BLOCK_SAMPLES - 1u) * 2u + 0u];
             s_mix_prev_r = s_mix_buffer[(CELL_AUDIO_BLOCK_SAMPLES - 1u) * 2u + 1u];
+            s_mix_was_active = (block_peak > 1e-4f) ? 1 : 0;
         }
+#if AUDIO_BACKEND_AAUDIO
+        {
+            static u32 s_stat_blocks = 0;
+            static u32 s_last_ur = 0, s_last_holes = 0;
+            if (++s_stat_blocks % 5625u == 0u) { /* ~30 s */
+                const u32 ur = __atomic_load_n(&s_aa_underruns, __ATOMIC_RELAXED);
+                if (ur != s_last_ur || s_mix_holes_total != s_last_holes || g_audio_dropped) {
+                    fprintf(stderr, "[cellAudio] 30s stats: underruns=%u (+%u) holes=%u (+%u) dropped=%llu q=%u blk\n",
+                            ur, ur - s_last_ur, s_mix_holes_total, s_mix_holes_total - s_last_holes,
+                            (unsigned long long)g_audio_dropped,
+                            audio_backend_queued_samples() / CELL_AUDIO_BLOCK_SAMPLES);
+                    s_last_ur = ur;
+                    s_last_holes = s_mix_holes_total;
+                }
+            }
+        }
+#endif
     }
 }
 
@@ -1112,7 +1175,8 @@ static void* audio_mix_thread_func(void* arg)
     (void)arg;
     ps3_thread_name("audio mix");
 #if defined(__linux__)
-    (void)setpriority(PRIO_PROCESS, 0, -10);
+    if (setpriority(PRIO_PROCESS, 0, -16) != 0)
+        (void)setpriority(PRIO_PROCESS, 0, -10);
 #endif
     printf("[cellAudio] Mixing thread started\n");
 

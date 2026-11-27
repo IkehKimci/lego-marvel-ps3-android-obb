@@ -3753,6 +3753,15 @@ static void sink_draw_arrays(void* user, const rsx_dispatch* r, u32 first, u32 c
 {
     (void)user; (void)r;
     dc.n_packets++;
+    if (!count) return;
+    if (!dc.inl && dc.n_arr > 0) {
+        u32 prev_first = dc.arr[dc.n_arr - 1].first;
+        u32 prev_count = dc.arr[dc.n_arr - 1].count;
+        if (prev_first + prev_count == first && count <= 0xFFFFFFFFu - prev_count) {
+            dc.arr[dc.n_arr - 1].count = prev_count + count;
+            return;
+        }
+    }
     if (dc.n_arr >= ENG_MAX_BATCHES) return;
     dc.arr[dc.n_arr].first = first;
     dc.arr[dc.n_arr].count = count;
@@ -3783,6 +3792,18 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
 {
     (void)user; (void)r;
     dc.n_packets++;
+    if (!count) return;
+    /* RSX NV4097_DRAW_INDEX_ARRAY encodes max 256 indices per command word, so
+     * every mesh >256 indices arrives as contiguous chunks. Coalescing adjacent
+     * ranges lets eng_vcache + GPU-resident VBO/IBO cache cover large meshes! */
+    if (dc.n_idx > 0) {
+        u32 prev_first = dc.idx[dc.n_idx - 1].first;
+        u32 prev_count = dc.idx[dc.n_idx - 1].count;
+        if (prev_first + prev_count == first && count <= 0xFFFFFFFFu - prev_count) {
+            dc.idx[dc.n_idx - 1].count = prev_count + count;
+            return;
+        }
+    }
     if (dc.n_idx >= ENG_MAX_BATCHES) return;
     dc.idx[dc.n_idx].first = first;
     dc.idx[dc.n_idx].count = count;

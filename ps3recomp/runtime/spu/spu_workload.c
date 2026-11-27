@@ -19,6 +19,9 @@
 #else
 #include <pthread.h>
 #include <errno.h>
+#ifdef __ANDROID__
+#include <sys/resource.h>
+#endif
 #include "../platform/win32_compat.h"   /* LONG, InterlockedExchange, Sleep */
 #include "spu_task_pool.h"              /* PS3RECOMP_SPU_TASK_POOL */
 #endif
@@ -1556,11 +1559,21 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      * per round) -- decisive for "is the Bink decode CPU-bound". TLS: each
      * task runs on its own host thread. */
     static _Thread_local unsigned long long s_wait_exit_ms;
+#ifdef __ANDROID__
+    static _Thread_local unsigned s_wait_calls;
+    if (++s_wait_calls == 16u) {
+        /* Persistent SPURS loop (e.g. task_audio / video decode): keep it ahead of
+         * normal threads and background shader compilation workers. */
+        (void)setpriority(PRIO_PROCESS, 0, -8);
+    }
+#endif
     { extern unsigned long long ps3_ms_now(void);
       unsigned long long _now = ps3_ms_now();
-      static unsigned _n = 0; if (_n++ < 200 || (_n % 500) == 0)   /* unsigned: periodic, wrapping is defined */
+      static volatile unsigned _n = 0;
+      const unsigned n = __atomic_fetch_add(&_n, 1u, __ATOMIC_RELAXED);
+      if (n < 32u || (n % 10000u) == 0u || ps3_log_verbose())
         fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%u enter task=%u taskset=0x%08X ran=%llums\n",
-                _n, taskId, taskset_ea,
+                n + 1u, taskId, taskset_ea,
                 s_wait_exit_ms ? (_now - s_wait_exit_ms) : 0ull); }
     /* LBP_SYNC_ACK: taskset sync-lane bookkeeping. On real SPURS the taskset
      * POLICY MODULE advances the per-SPU progress lanes (sync+0x40+16*row:

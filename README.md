@@ -6,8 +6,11 @@ Native Android ARM64 static-recompilation port of **LEGO® Marvel Super Heroes (
 
 ---
 
-## Features (`v0.2.3-BLUS31161`)
+## Features (`v0.2.4-BLUS31161`)
 
+- **Anti-Stutter Cutscene (Async Shader & Pipeline Compiler Pool — ARMSX3/RPCS3-Style):**
+  - **Multi-Threaded Background Pipeline Compiler (`PS3RECOMP_VK_ASYNC_PIPE=1`):** Meng-offload kompilasi HLSL→SPIR-V (`glslang`) + `vkCreateGraphicsPipelines` (`TRIANGLE_LIST` pre-build) ke 2–3 worker thread berprioritas rendah (`nice +4`), memisahkan lock disk I/O `spirv_cache/`, dan memindahkan `vkGetPipelineCacheData` (>9 MB) sepenuhnya ke background thread — **menghilangkan framedrop saat ganti cutscene**.
+  - **Coalescing `DRAW_INDEX_ARRAY` / `DRAW_ARRAYS` + Ring Lebih Lega:** Menggabungkan potongan >256 indeks RSX yang berurutan menjadi 1 batch agar mesh besar masuk ke `eng_vcache` + GPU-resident VBO/IBO cache (`s_gpuvc`), ditambah kenaikan ring ≥6 GB RAM ke `32 MB VB` + `10 MB IB`.
 - **Optimasi Besar Adreno / Vulkan (Terinspirasi dari ARMSX3):**
   - **GPU-Resident Persistent VBO/IBO Cache (`s_gpuvc`):** Menyimpan mesh statis hingga `64 MB VB + 24 MB IB` (RAM ≥6 GB) langsung di memori GPU/UMA berdasarkan `vc_id` — menghilangkan 40–60 MB/frame `memcpy` vertex/index setiap frame.
   - **Triple Buffering (`VK_EB_SLOTS=3`) + Ring Dinamis RAM-Aware + Early Submit:** UBO ring hingga `48 MB`/slot (nol ring overflow) dan **Non-Blocking Early Submit** via `vkGetFenceStatus` di batas render pass agar GPU merender pass pertama secara paralel saat CPU merekam pass berikutnya.
@@ -29,7 +32,7 @@ Native Android ARM64 static-recompilation port of **LEGO® Marvel Super Heroes (
   - **`Optical-Flow 2×`**: Symmetric bidirectional coarse-to-fine optical flow at $t = 0.5$ with static-HUD protection and disocclusion / scene-cut anti-ghosting guard.
   - **`Fast Blend 2× (Low-End)`**: Lightweight 2-tap motion blend for entry-level GPUs.
   - Auto-bypasses when real FPS is already ~60 FPS; preserves FSR1/CAS/Integer scaling on every real frame.
-- **Anti-Crackle Native Audio (`AAudio`):** 16384-frame (~341 ms) lock-free SPSC ring, 42.7 ms prefill cushion, Android-tuned SPU pacing watermarks, smooth exponential-decay underrun/hole de-click ramps, normalized 7.1→stereo downmix, and $C^1$ soft-limiter (eliminates crackling/clipping in busy scenes).
+- **Anti-Crackle Native Audio (`AAudio`):** 32768-frame (~682 ms) lock-free SPSC ring, 85.3 ms prefill cushion (midway between `HI=24 / LO=10` blocks), `4×` hardware burst buffer tuning, `4.0 ms` minimum inter-mix pacing (`AUDIO_PACE_MIN_STEP_NS`) mencegah burst catch-up mendahului SPU `task_audio`, prioritas thread tinggi (`nice -16` mixer / `-8` SPURS `task_audio`), 1-block mirrored Packet Loss Concealment (PLC) + crossfade, normalized 7.1→stereo downmix, and $C^1$ soft-limiter (eliminates crackling/clipping in busy scenes & cutscenes).
 - **Full Physical Gamepad Support (USB / Bluetooth — P1 & P2):**
   - Supports **PS4 / DualSense, Xbox, Switch Pro / Nintendo (A↔B & X↔Y swap), Gamesir, and generic HID controllers** with simultaneous 2-player local & 2-phone co-op.
   - Analog + digital triggers (`LTRIGGER`/`BRAKE`, `RTRIGGER`/`GAS`), right-stick `Z/RZ` + `RX/RY` fallback, smooth radial deadzone (`0.08`), **DualShock 3 square outer-gate projection** (100% diagonal run speed), gamepad `BACK`-button guard, live controller detector in Launcher, and **auto-hide virtual touch controls** when physical gamepad is active (tap screen anytime to show again).

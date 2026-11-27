@@ -26,9 +26,15 @@
  * can spike 15-38 ms during busy gameplay scenes, so keep a wider 42-85 ms
  * jitter cushion to prevent AAudio ring underruns and crackling. */
 #ifdef __ANDROID__
-#define AUDIO_PACE_QUEUE_HI_BLOCKS  16U
-#define AUDIO_PACE_QUEUE_LO_BLOCKS  8U
-#define AUDIO_PACE_STALL_PERIODS    8U
+#define AUDIO_PACE_QUEUE_HI_BLOCKS  24U
+#define AUDIO_PACE_QUEUE_LO_BLOCKS  10U
+#define AUDIO_PACE_STALL_PERIODS    10U
+/* Minimum spacing between consecutive guest mixes on Android (4.0 ms = 75% of
+ * the 5.33 ms PS3 period). Without this floor, a large AAudio callback burst
+ * (10-20 ms) or brief scheduler delay causes < LO / backlog catch-up to fire
+ * 2-4 mixes 50 us apart, outrunning SPU task_audio and reading unwritten or
+ * half-written guest blocks (audible crackling). */
+#define AUDIO_PACE_MIN_STEP_NS      4000000ULL
 #else
 #define AUDIO_PACE_QUEUE_HI_BLOCKS  6U
 
@@ -40,6 +46,7 @@
 /* More than this many periods late (a host stall, a debugger stop), restart the
  * cadence at now instead of mixing the backlog as a burst of guest events. */
 #define AUDIO_PACE_STALL_PERIODS    4U
+#define AUDIO_PACE_MIN_STEP_NS      0ULL
 #endif
 
 typedef enum audio_pace_action {
@@ -52,6 +59,7 @@ typedef struct audio_pace_state {
     uint64_t anchor_ns;
     uint64_t period_idx;
     uint64_t reanchor_count;
+    uint64_t last_mix_ns;
 } audio_pace_state;
 
 typedef struct audio_pace_decision {
@@ -71,6 +79,7 @@ static inline void audio_pace_init(audio_pace_state* state, uint64_t now_ns)
     state->anchor_ns = now_ns;
     state->period_idx = 0;
     state->reanchor_count = 0;
+    state->last_mix_ns = 0;
 }
 
 static inline audio_pace_decision audio_pace_decide(audio_pace_state* state, uint64_t now_ns,
@@ -94,12 +103,23 @@ static inline audio_pace_decision audio_pace_decide(audio_pace_state* state, uin
     }
 
     if (has_device && now_ns < deadline && queued_blocks < AUDIO_PACE_QUEUE_LO_BLOCKS) {
+        if (AUDIO_PACE_MIN_STEP_NS > 0ULL && state->last_mix_ns != 0ULL) {
+            const uint64_t earliest = state->last_mix_ns + AUDIO_PACE_MIN_STEP_NS;
+            if (now_ns < earliest) {
+                const uint64_t wake = earliest < deadline ? earliest : deadline;
+                dec.action = AUDIO_PACE_ACTION_SLEEP;
+                dec.deadline_ns = wake;
+                dec.sleep_ns = wake - now_ns;
+                return dec;
+            }
+        }
         if (state->anchor_ns != now_ns) {
             state->anchor_ns = now_ns;
             state->reanchor_count++;
             dec.reanchored = true;
         }
         state->period_idx = 1;
+        state->last_mix_ns = now_ns;
         return dec;
     }
 
@@ -110,9 +130,24 @@ static inline audio_pace_decision audio_pace_decide(audio_pace_state* state, uin
         return dec;
     }
 
-    state->period_idx++;
-    if (has_device && queued_blocks >= AUDIO_PACE_QUEUE_HI_BLOCKS)
+    if (has_device && queued_blocks >= AUDIO_PACE_QUEUE_HI_BLOCKS) {
+        state->period_idx++;
         dec.action = AUDIO_PACE_ACTION_SKIP;
+        return dec;
+    }
+
+    if (AUDIO_PACE_MIN_STEP_NS > 0ULL && state->last_mix_ns != 0ULL) {
+        const uint64_t earliest = state->last_mix_ns + AUDIO_PACE_MIN_STEP_NS;
+        if (now_ns < earliest) {
+            dec.action = AUDIO_PACE_ACTION_SLEEP;
+            dec.deadline_ns = earliest;
+            dec.sleep_ns = earliest - now_ns;
+            return dec;
+        }
+    }
+
+    state->period_idx++;
+    state->last_mix_ns = now_ns;
     return dec;
 }
 
