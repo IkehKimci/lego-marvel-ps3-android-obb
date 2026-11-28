@@ -758,8 +758,26 @@ static int64_t event_queue_receive_pinned(ppu_context* ctx, sys_event_queue_info
     q->waiters++;                       /* see the _WIN32 branch */
 
     if (timeout_us == 0) {
+        extern int  ppu_gcm_has_pending(void) __attribute__((weak));
+        extern void ppu_gcm_pump(void)        __attribute__((weak));
         while (q->count == 0 && q->active && !q->cancelled) {
-            pthread_cond_wait(&q->not_empty, &q->lock);
+            if (ppu_gcm_pump && ppu_gcm_has_pending && ppu_gcm_has_pending()) {
+                q->waiters--;
+                pthread_mutex_unlock(&q->lock);
+                ppu_gcm_pump();
+                pthread_mutex_lock(&q->lock);
+                q->waiters++;
+                continue;
+            }
+            if (ppu_gcm_pump) {
+                struct timespec sl;
+                clock_gettime(CLOCK_REALTIME, &sl);
+                sl.tv_nsec += 4000000L; /* 4 ms slice for VBlank/Flip pump */
+                if (sl.tv_nsec >= 1000000000L) { sl.tv_sec++; sl.tv_nsec -= 1000000000L; }
+                pthread_cond_timedwait(&q->not_empty, &q->lock, &sl);
+            } else {
+                pthread_cond_wait(&q->not_empty, &q->lock);
+            }
         }
     } else {
         struct timespec ts;
@@ -1607,8 +1625,34 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     pthread_mutex_lock(&f->lock);
 
     if (timeout_us == 0) {
+        extern int  ppu_gcm_has_pending(void) __attribute__((weak));
+        extern void ppu_gcm_pump(void)        __attribute__((weak));
+        unsigned waited_slices = 0;
         while (!flag_check(f->pattern, bitpat, mode) && f->active) {
-            pthread_cond_wait(&f->cv, &f->lock);
+            if (ppu_gcm_pump && ppu_gcm_has_pending && ppu_gcm_has_pending()) {
+                pthread_mutex_unlock(&f->lock);
+                ppu_gcm_pump();
+                pthread_mutex_lock(&f->lock);
+                continue;
+            }
+            if (ppu_gcm_pump) {
+                struct timespec sl;
+                clock_gettime(CLOCK_REALTIME, &sl);
+                sl.tv_nsec += 4000000L; /* 4 ms slice for VBlank/Flip pump */
+                if (sl.tv_nsec >= 1000000000L) { sl.tv_sec++; sl.tv_nsec -= 1000000000L; }
+                int rc = pthread_cond_timedwait(&f->cv, &f->lock, &sl);
+                if (rc == ETIMEDOUT && !flag_check(f->pattern, bitpat, mode) && f->active) {
+                    waited_slices++;
+                    if (waited_slices == 1500u || (waited_slices > 1500u && (waited_slices % 2500u) == 0u)) {
+                        fprintf(stderr, "[WATCHDOG][ef] tid=%llu waiting %us on flag_id=%u (cur=0x%llX want=0x%llX mode=0x%X lr=0x%08X)\n",
+                                (unsigned long long)ctx->thread_id, (waited_slices * 4u) / 1000u,
+                                flag_id, (unsigned long long)f->pattern, (unsigned long long)bitpat,
+                                mode, (uint32_t)ctx->lr);
+                    }
+                }
+            } else {
+                pthread_cond_wait(&f->cv, &f->lock);
+            }
         }
     } else {
         struct timespec ts;

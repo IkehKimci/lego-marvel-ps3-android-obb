@@ -18,7 +18,7 @@
 #include <stdlib.h>
 
 typedef void (*spu_dispatch_fn)(spu_context*);
-spu_dispatch_fn spu_lookup(uint32_t addr, int image_id);  /* spu_channels.c (exported) */
+spu_dispatch_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa); /* spu_channels.c (cached + reloc) */
 void spu_indirect_branch(spu_context* ctx);               /* full resolver in the lib */
 
 void spu_indirect_branch_mt(spu_context* ctx)
@@ -53,13 +53,12 @@ void spu_indirect_branch_mt(spu_context* ctx)
                    (pc == SPURS_PM_EXIT_TO_KERNEL_LS ||
                     pc == SPURS_PM_SELECT_WORKLOAD_LS))
                   || pc == SPURS_TASKSET_PM_SYSCALL_LS
+                  || (!ctx->policy_mode && pc == 0x3FF00u)
                   || ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID;
     if (!special) {
-        /* Resident overlay first (mirrors the full resolver): streamed plugin
-         * code owns its LS range; base-image entries at the same address are
-         * stale bytes and must lose. */
-        spu_dispatch_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
-        if (!fn) fn = spu_lookup(pc, ctx->image_id);
+        /* Use the thread-local dispatch cache (handles resident_code[] reloc
+         * plugins, resident_ovl, resident_task, and primary image in O(1)). */
+        spu_dispatch_fn fn = spu_lifted_lookup(ctx, pc);
         if (fn) {
             ctx->pc = pc;
             __attribute__((musttail)) return fn(ctx);

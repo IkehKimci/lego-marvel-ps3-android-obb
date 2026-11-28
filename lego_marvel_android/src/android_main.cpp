@@ -560,6 +560,39 @@ static void enforce_blus31161_fps_limit(void)
     }
 }
 
+static std::atomic<uint64_t> g_clk_hb_ns{0};
+static std::atomic<int>      g_clk_stage{0}; /* 0=kick_wait 1=tick 2=fifo 3=present */
+
+extern "C" void cellGcm_debug_dump_stall(void) __attribute__((weak));
+extern "C" void cellSpurs_debug_dump_stall(void) __attribute__((weak));
+
+extern "C" void android_watchdog_poll(void)
+{
+    static long s_last_frames = -1;
+    static unsigned s_stall_ticks = 0;
+    const long cur = (long)g_frames_presented;
+    if (cur <= 60 || g_clock_stop.load(std::memory_order_acquire)) {
+        s_last_frames = cur;
+        s_stall_ticks = 0;
+        return;
+    }
+    if (cur != s_last_frames) {
+        s_last_frames = cur;
+        s_stall_ticks = 0;
+        return;
+    }
+    if (++s_stall_ticks >= 1u) {
+        const uint64_t hb = g_clk_hb_ns.load(std::memory_order_acquire);
+        const uint64_t now = monotonic_ns();
+        const unsigned long long age_ms = (hb && now > hb) ? (unsigned long long)((now - hb) / 1000000ull) : 0ull;
+        fprintf(stderr, "[WATCHDOG] RENDER STALLED (%us): frames=%ld clk_age=%llums clk_stage=%d\n",
+                s_stall_ticks * 10u, cur, age_ms, g_clk_stage.load(std::memory_order_acquire));
+        if (cellGcm_debug_dump_stall) cellGcm_debug_dump_stall();
+        if (cellSpurs_debug_dump_stall) cellSpurs_debug_dump_stall();
+        fflush(stderr);
+    }
+}
+
 static DWORD WINAPI frame_clock(LPVOID)
 {
     const char* title = getenv("PS3_TITLE");
@@ -575,10 +608,13 @@ static DWORD WINAPI frame_clock(LPVOID)
     uint64_t next_tick_ns = monotonic_ns() + vblank_ns;
 
     while (!g_clock_stop.load(std::memory_order_acquire)) {
+        g_clk_stage.store(0, std::memory_order_release);
+        g_clk_hb_ns.store(monotonic_ns(), std::memory_order_release);
         cellGcm_fifo_kick_wait(2);
         const uint64_t now_ns = monotonic_ns();
 
         if ((int64_t)(now_ns - next_tick_ns) >= 0) {
+            g_clk_stage.store(1, std::memory_order_release);
             cellGcmTickVBlank();
             cellGcmTickFlip();
             if (cellGcm_flip_request_count() > 0) {
@@ -595,9 +631,11 @@ static DWORD WINAPI frame_clock(LPVOID)
 
         if (rsx_ok) {
             if (cellGcm_take_flip_pending()) {
+                g_clk_stage.store(3, std::memory_order_release);
                 present_guest_frame();
                 last_flip = cellGcm_flip_request_count();
             }
+            g_clk_stage.store(2, std::memory_order_release);
             cellGcm_rsx_process_fifo();
             cellGcmTickFlip();
 
@@ -608,9 +646,11 @@ static DWORD WINAPI frame_clock(LPVOID)
             const int fp = cellGcm_take_flip_pending();
             const unsigned fc = cellGcm_flip_request_count();
             if (fp || fc != last_flip) {
+                g_clk_stage.store(3, std::memory_order_release);
                 present_guest_frame();
                 last_flip = fc;
             } else if (fc == 0) {
+                g_clk_stage.store(3, std::memory_order_release);
                 rsx_vulkan_backend_present();
             }
         }

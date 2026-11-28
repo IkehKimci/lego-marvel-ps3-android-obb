@@ -116,6 +116,7 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
   #include <errno.h>   /* EINTR from clock_nanosleep */
   #if defined(__linux__)
     #include <sys/resource.h>
+    #include <sched.h>
   #endif
   typedef pthread_t thread_t;
   typedef pthread_mutex_t mutex_t;
@@ -134,6 +135,11 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
  * host buffers and expose their addresses through portAddr/readIndexAddr. */
 #define AUDIO_PORT_BUF_MAX  (CELL_AUDIO_BLOCK_32 * CELL_AUDIO_BLOCK_SAMPLES * CELL_AUDIO_PORT_8CH)
 
+/* ARMSX3/RPCS3 -0.0f port completion tag geometry (6 diagonal tags + 8ch front-right marks). */
+#define AUDIO_PORT_TAG_COUNT          6u
+#define AUDIO_NEG_ZERO_BE_BITS        0x00000080u /* IEEE-754 -0.0f stored big-endian in guest RAM */
+#define AUDIO_FRONT_ONLY_SETTLE       8u
+
 typedef struct {
     int                  in_use;
     int                  running;
@@ -145,6 +151,12 @@ typedef struct {
     /* For address reporting to guest */
     u64                  port_addr;      /* guest-visible buffer address */
     u64                  read_idx_addr;  /* guest-visible read index address */
+    /* ARMSX3 -0.0f buffer completion tag state (prevents reading empty/half-written blocks) */
+    u32                  prev_touched_tag_nr;
+    u32                  last_tag_bits[AUDIO_PORT_TAG_COUNT];
+    u8                   periods_without_tag;
+    u8                   front_only_port;
+    u8                   front_only_reported;
 } AudioPortSlot;
 
 static int            s_audio_initialized = 0;
@@ -253,11 +265,12 @@ static u32 audio_backend_queued_samples(void)
 
 /* Lock-free single-producer / single-consumer stereo float ring buffer.
  * Power-of-two capacity: 32768 stereo frames (~682.7 ms at 48 kHz, 128 PS3 blocks).
- * Prefill sits at 16 blocks (85.3 ms), squarely midway between LO=10 and HI=24 so
- * 10-20 ms AudioFlinger bursts never trip < LO catch-up bursts. */
-#define AAUDIO_RING_FRAMES    32768u
-#define AAUDIO_RING_MASK      (AAUDIO_RING_FRAMES - 1u)
-#define AAUDIO_PREFILL_FRAMES (CELL_AUDIO_BLOCK_SAMPLES * 16u)
+ * Wide capacity guarantees burst refills never drop a single waveform block
+ * (ARMSX3 cellAudio.cpp headroom rule) while the dynamic controller tracks
+ * desired_buffer_duration (~64 ms = 12 blocks by default). */
+#define AAUDIO_RING_FRAMES        32768u
+#define AAUDIO_RING_MASK          (AAUDIO_RING_FRAMES - 1u)
+#define AAUDIO_DEFAULT_BUF_MS     64u
 
 typedef aaudio_result_t (*pfn_AAudio_createStreamBuilder)(AAudioStreamBuilder**);
 typedef void            (*pfn_AAudioStreamBuilder_setDirection)(AAudioStreamBuilder*, aaudio_direction_t);
@@ -266,12 +279,17 @@ typedef void            (*pfn_AAudioStreamBuilder_setChannelCount)(AAudioStreamB
 typedef void            (*pfn_AAudioStreamBuilder_setFormat)(AAudioStreamBuilder*, aaudio_format_t);
 typedef void            (*pfn_AAudioStreamBuilder_setSharingMode)(AAudioStreamBuilder*, aaudio_sharing_mode_t);
 typedef void            (*pfn_AAudioStreamBuilder_setPerformanceMode)(AAudioStreamBuilder*, aaudio_performance_mode_t);
+typedef void            (*pfn_AAudioStreamBuilder_setUsage)(AAudioStreamBuilder*, int32_t);
+typedef void            (*pfn_AAudioStreamBuilder_setBufferCapacityInFrames)(AAudioStreamBuilder*, int32_t);
 typedef void            (*pfn_AAudioStreamBuilder_setDataCallback)(AAudioStreamBuilder*, AAudioStream_dataCallback, void*);
+typedef void            (*pfn_AAudioStreamBuilder_setErrorCallback)(AAudioStreamBuilder*, AAudioStream_errorCallback, void*);
 typedef aaudio_result_t (*pfn_AAudioStreamBuilder_openStream)(AAudioStreamBuilder*, AAudioStream**);
 typedef aaudio_result_t (*pfn_AAudioStreamBuilder_delete)(AAudioStreamBuilder*);
 typedef aaudio_result_t (*pfn_AAudioStream_requestStart)(AAudioStream*);
 typedef aaudio_result_t (*pfn_AAudioStream_requestStop)(AAudioStream*);
 typedef aaudio_result_t (*pfn_AAudioStream_close)(AAudioStream*);
+typedef int32_t         (*pfn_AAudioStream_getSampleRate)(AAudioStream*);
+typedef int32_t         (*pfn_AAudioStream_getState)(AAudioStream*);
 typedef int32_t         (*pfn_AAudioStream_getFramesPerBurst)(AAudioStream*);
 typedef int32_t         (*pfn_AAudioStream_getBufferCapacityInFrames)(AAudioStream*);
 typedef aaudio_result_t (*pfn_AAudioStream_setBufferSizeInFrames)(AAudioStream*, int32_t);
@@ -280,14 +298,26 @@ static void*         s_aa_lib    = NULL;
 static AAudioStream* s_aa_stream = NULL;
 static pfn_AAudioStream_requestStop p_aa_stop  = NULL;
 static pfn_AAudioStream_close       p_aa_close = NULL;
+static pfn_AAudioStream_getState    p_aa_state = NULL;
 
 static float         s_aa_ring[AAUDIO_RING_FRAMES * 2u];
 static volatile u32  s_aa_read_pos  = 0;
 static volatile u32  s_aa_write_pos = 0;
 static volatile u32  s_aa_underruns = 0;
+static volatile int  s_aa_reset_req = 0;
+static u32           s_aa_desired_ms = AAUDIO_DEFAULT_BUF_MS;
+static u32           s_aa_burst_frames = 192u;
 static float         s_aa_last_l    = 0.0f;
 static float         s_aa_last_r    = 0.0f;
 static u32           s_aa_fade_in   = 0;
+
+static void aaudio_error_cb(AAudioStream* stream, void* userData, aaudio_result_t error)
+{
+    (void)stream;
+    (void)userData;
+    fprintf(stderr, "[cellAudio] AAudio stream error/disconnect (%d); scheduling auto-recovery\n", (int)error);
+    __atomic_store_n(&s_aa_reset_req, 1, __ATOMIC_RELEASE);
+}
 
 static aaudio_data_callback_result_t aaudio_data_cb(
     AAudioStream* stream, void* userData, void* audioData, int32_t numFrames)
@@ -323,12 +353,12 @@ static aaudio_data_callback_result_t aaudio_data_cb(
         last_r = sr;
     }
     if (take < want) {
+        /* ARMSX3 rule: count 1 underrun per starved callback and softly hold/decay
+         * the last sample rather than dropping to a hard-zero step click. */
         __atomic_add_fetch(&s_aa_underruns, 1u, __ATOMIC_RELAXED);
-        /* Exponential decay instead of hard-zero step eliminates sharp clicks/pops
-         * if a heavy scene stalls the SPU audio task past the jitter cushion. */
         for (u32 i = take; i < want; i++) {
-            last_l *= 0.965f;
-            last_r *= 0.965f;
+            last_l *= 0.985f;
+            last_r *= 0.985f;
             out[i * 2u + 0u] = last_l;
             out[i * 2u + 1u] = last_r;
         }
@@ -343,15 +373,29 @@ static aaudio_data_callback_result_t aaudio_data_cb(
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
-static int audio_backend_init(void)
+static int audio_backend_open_aaudio(int reset_ring)
 {
-    s_aa_read_pos = 0;
-    s_aa_write_pos = AAUDIO_PREFILL_FRAMES; /* start with 85.3 ms silence cushion */
-    s_aa_underruns = 0;
-    s_aa_last_l = 0.0f;
-    s_aa_last_r = 0.0f;
-    s_aa_fade_in = 0;
-    memset(s_aa_ring, 0, sizeof(s_aa_ring));
+    u32 desired_ms = AAUDIO_DEFAULT_BUF_MS;
+    {
+        const char* e = getenv("PS3_AUDIO_BUF_MS");
+        if (e && *e) {
+            const int v = atoi(e);
+            if (v >= 24 && v <= 200) desired_ms = (u32)v;
+        }
+    }
+    s_aa_desired_ms = desired_ms;
+    const u32 desired_frames = (CELL_AUDIO_SAMPLE_RATE * desired_ms) / 1000u;
+
+    if (reset_ring) {
+        s_aa_read_pos = 0;
+        s_aa_write_pos = desired_frames; /* prefill exact target duration */
+        s_aa_underruns = 0;
+        s_aa_last_l = 0.0f;
+        s_aa_last_r = 0.0f;
+        s_aa_fade_in = 0;
+        memset(s_aa_ring, 0, sizeof(s_aa_ring));
+    }
+    __atomic_store_n(&s_aa_reset_req, 0, __ATOMIC_RELEASE);
 
     if (!s_aa_lib) {
         s_aa_lib = dlopen("libaaudio.so", RTLD_NOW | RTLD_LOCAL);
@@ -380,6 +424,16 @@ static int audio_backend_init(void)
     AA_SYM(close_stream,   AAudioStream_close);
 #undef AA_SYM
 
+    pfn_AAudioStreamBuilder_setUsage set_usage =
+        (pfn_AAudioStreamBuilder_setUsage)dlsym(s_aa_lib, "AAudioStreamBuilder_setUsage");
+    pfn_AAudioStreamBuilder_setBufferCapacityInFrames set_cap =
+        (pfn_AAudioStreamBuilder_setBufferCapacityInFrames)dlsym(s_aa_lib, "AAudioStreamBuilder_setBufferCapacityInFrames");
+    pfn_AAudioStreamBuilder_setErrorCallback set_err =
+        (pfn_AAudioStreamBuilder_setErrorCallback)dlsym(s_aa_lib, "AAudioStreamBuilder_setErrorCallback");
+    pfn_AAudioStream_getSampleRate get_rate =
+        (pfn_AAudioStream_getSampleRate)dlsym(s_aa_lib, "AAudioStream_getSampleRate");
+    pfn_AAudioStream_getState get_state =
+        (pfn_AAudioStream_getState)dlsym(s_aa_lib, "AAudioStream_getState");
     pfn_AAudioStream_getFramesPerBurst get_burst =
         (pfn_AAudioStream_getFramesPerBurst)dlsym(s_aa_lib, "AAudioStream_getFramesPerBurst");
     pfn_AAudioStream_getBufferCapacityInFrames get_cap =
@@ -389,6 +443,7 @@ static int audio_backend_init(void)
 
     p_aa_stop  = req_stop;
     p_aa_close = close_stream;
+    p_aa_state = get_state;
 
     AAudioStreamBuilder* builder = NULL;
     if (create_builder(&builder) != AAUDIO_OK || !builder) {
@@ -396,15 +451,25 @@ static int audio_backend_init(void)
         return -1;
     }
 
+    /* ARMSX3 OboeBackend recipe:
+     * - SHARED mode (never Exclusive, which OS disconnects under 10 FPS spikes).
+     * - LOW_LATENCY by default for crisp 2-4 ms callbacks (no 40 ms deep-buffer
+     *   sawtooth); PS3_AUDIO_RECORDING_COMPAT=1 selects NONE for AudioPlaybackCapture.
+     * - USAGE_GAME (14) bypasses Android media post-processing latency chain.
+     * - Buffer capacity & size scaled to desired_buffer_duration (whole bursts). */
+    const char* rec_env = getenv("PS3_AUDIO_RECORDING_COMPAT");
+    const int low_latency = !(rec_env && rec_env[0] == '1');
+
     set_dir(builder, AAUDIO_DIRECTION_OUTPUT);
     set_rate(builder, CELL_AUDIO_SAMPLE_RATE);
     set_ch(builder, 2);
     set_fmt(builder, AAUDIO_FORMAT_PCM_FLOAT);
     set_share(builder, AAUDIO_SHARING_MODE_SHARED);
-    /* Balanced mode avoids tiny 2ms hardware burst callbacks that underrun/crackle
-     * under heavy CPU/GPU contention on mid-range and low-end Android devices. */
-    set_perf(builder, AAUDIO_PERFORMANCE_MODE_NONE);
+    set_perf(builder, low_latency ? AAUDIO_PERFORMANCE_MODE_LOW_LATENCY : AAUDIO_PERFORMANCE_MODE_NONE);
+    if (set_usage) set_usage(builder, 14 /* AAUDIO_USAGE_GAME */);
+    if (set_cap)   set_cap(builder, (int32_t)(desired_frames < 4096u ? 4096u : desired_frames));
     set_cb(builder, aaudio_data_cb, NULL);
+    if (set_err)   set_err(builder, aaudio_error_cb, NULL);
 
     aaudio_result_t res = open_stream(builder, &s_aa_stream);
     del_builder(builder);
@@ -414,11 +479,22 @@ static int audio_backend_init(void)
         return -1;
     }
 
-    int32_t burst = get_burst ? get_burst(s_aa_stream) : 0;
-    int32_t cap = get_cap ? get_cap(s_aa_stream) : 0;
+    const int32_t actual_rate = get_rate ? get_rate(s_aa_stream) : CELL_AUDIO_SAMPLE_RATE;
+    if (actual_rate > 0 && actual_rate != CELL_AUDIO_SAMPLE_RATE) {
+        printf("[cellAudio] WARNING: AAudio opened at %d Hz (requested %d Hz)\n",
+               actual_rate, CELL_AUDIO_SAMPLE_RATE);
+    }
+
+    const int32_t burst = get_burst ? get_burst(s_aa_stream) : 0;
+    const int32_t cap = get_cap ? get_cap(s_aa_stream) : 0;
     int32_t tuned_buf = 0;
+    if (burst > 0) s_aa_burst_frames = (u32)burst;
     if (set_buf && burst > 0 && cap > 0) {
-        int32_t want_buf = burst * 4;
+        const int32_t rate_use = actual_rate > 0 ? actual_rate : CELL_AUDIO_SAMPLE_RATE;
+        const int32_t target = (int32_t)(((u64)rate_use * desired_ms) / 1000u);
+        int32_t bursts = (target + burst - 1) / burst;
+        if (bursts < 2) bursts = 2;
+        int32_t want_buf = bursts * burst;
         if (want_buf > cap) want_buf = cap;
         if (want_buf > 0) tuned_buf = (int32_t)set_buf(s_aa_stream, want_buf);
     }
@@ -431,11 +507,15 @@ static int audio_backend_init(void)
         return -1;
     }
 
-    printf("[cellAudio] AAudio backend initialized (%d Hz stereo f32, ring=%u frames, cushion=%u ms, burst=%d buf=%d/%d)\n",
-           CELL_AUDIO_SAMPLE_RATE, AAUDIO_RING_FRAMES,
-           (unsigned)((AAUDIO_PREFILL_FRAMES * 1000u) / CELL_AUDIO_SAMPLE_RATE),
-           burst, tuned_buf, cap);
+    printf("[cellAudio] AAudio (ARMSX3-tuned) initialized (%d Hz stereo f32, %s, ring=%u frames, target=%u ms, burst=%d buf=%d/%d)\n",
+           actual_rate, low_latency ? "LOW_LATENCY/SHARED/GAME" : "REC_COMPAT/SHARED/GAME",
+           AAUDIO_RING_FRAMES, desired_ms, burst, tuned_buf, cap);
     return 0;
+}
+
+static int audio_backend_init(void)
+{
+    return audio_backend_open_aaudio(1);
 }
 
 static void audio_backend_shutdown(void)
@@ -447,6 +527,19 @@ static void audio_backend_shutdown(void)
     }
     /* Keep libaaudio.so loaded for process lifetime: Android's Binder/audio
      * teardown threads may still be unwinding after AAudioStream_close(). */
+}
+
+static int audio_backend_is_operational(void)
+{
+    if (!s_aa_stream || __atomic_load_n(&s_aa_reset_req, __ATOMIC_ACQUIRE))
+        return 0;
+    if (p_aa_state) {
+        /* AAudio active states: OPEN(2)..FLUSHED(8). Anything else (DISCONNECTED=13,
+         * CLOSED=12, STOPPED=10, UNINITIALIZED=0) triggers clean reopen. */
+        const int32_t st = p_aa_state(s_aa_stream);
+        if (st < 2 || st > 8) return 0;
+    }
+    return 1;
 }
 
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
@@ -480,11 +573,203 @@ static u32 audio_backend_queued_samples(void)
     return w - r;
 }
 
-static int audio_backend_room(void)
+/* ---------------------------------------------------------------------------
+ * Built-in Zero-Allocation Stereo WSOLA Time-Stretcher (ARMSX3-style tempo
+ * scaling without pitch shift when SPU task_audio falls behind real-time).
+ * - Zero latency & zero CPU when tempo >= 0.992 (direct passthrough).
+ * - When ring depth drops below 75% of target, smoothly scales tempo in
+ *   [0.50, 1.00] using normalized cross-correlation phase search + 4.0 ms
+ *   Hann crossfade, eliminating crackling/underruns even on 10 FPS spikes.
+ * - Entry seeds prev_ovl with the UNPLAYED leading edge of the first block
+ *   (exact C0 sample continuity with passthrough), and exit aligns via cross-
+ *   correlation so engaging/disengaging is click-free.
+ * -------------------------------------------------------------------------*/
+#define WSOLA_OVL      192u                         /* 4.0 ms Hann crossfade */
+#define WSOLA_HOP_OUT  384u                         /* 8.0 ms output hop */
+#define WSOLA_SEQ      (WSOLA_HOP_OUT + WSOLA_OVL)  /* 576 frames = 12.0 ms */
+#define WSOLA_SEEK     192u                         /* 4.0 ms phase search (total 768 = 3 PS3 blocks) */
+#define WSOLA_IN_CAP   4096u
+
+static struct {
+    float  in_buf[WSOLA_IN_CAP * 2u];
+    u32    in_len;
+    float  prev_ovl[WSOLA_OVL * 2u];
+    float  out_buf[WSOLA_HOP_OUT * 2u];
+    float  hann[WSOLA_OVL];
+    float  tempo;
+    double in_frac;
+    int    active;
+    int    inited;
+} s_wsola;
+
+static void cellAudio_coop_tap_push(const float* stereo_48k, u32 num_frames_48k);
+
+static void audio_ts_init(void)
 {
-    if (!s_aa_stream) return -1;
-    return audio_backend_queued_samples() < CELL_AUDIO_BLOCK_SAMPLES * AUDIO_PACE_QUEUE_HI_BLOCKS
-         ? (int)CELL_AUDIO_BLOCK_SAMPLES : 0;
+    if (!s_wsola.inited) {
+        const double pi = 3.14159265358979323846;
+        for (u32 i = 0; i < WSOLA_OVL; i++)
+            s_wsola.hann[i] = (float)(0.5 * (1.0 - cos(pi * (double)i / (double)WSOLA_OVL)));
+        s_wsola.inited = 1;
+    }
+    s_wsola.in_len = 0;
+    s_wsola.tempo = 1.0f;
+    s_wsola.in_frac = 0.0;
+    s_wsola.active = 0;
+    memset(s_wsola.prev_ovl, 0, sizeof(s_wsola.prev_ovl));
+}
+
+static u32 audio_ts_queued_out_frames(void)
+{
+    if (!s_wsola.active || !s_wsola.in_len) return 0u;
+    const float t = s_wsola.tempo < 0.50f ? 0.50f : s_wsola.tempo;
+    return (u32)((double)s_wsola.in_len / (double)t);
+}
+
+static void audio_ts_emit_raw(const float* pcm, u32 frames)
+{
+    audio_backend_submit(pcm, frames);
+    cellAudio_coop_tap_push(pcm, frames);
+}
+
+static u32 audio_ts_best_offset(const float* prev_ovl, const float* in_buf, u32 max_seek)
+{
+    if (max_seek == 0u) return 0u;
+    /* Compute energy of prev_ovl (decimated by 4 for coarse pass). */
+    float e_prev = 0.0f;
+    for (u32 i = 0; i < WSOLA_OVL; i += 4u) {
+        const float m = prev_ovl[i * 2u] + prev_ovl[i * 2u + 1u];
+        e_prev += m * m;
+    }
+    if (e_prev < 1e-8f) return 0u;
+
+    u32 best_d = 0u;
+    float best_score = -2.0f;
+    for (u32 d = 0; d <= max_seek; d += 4u) {
+        float num = 0.0f, ec = 0.0f;
+        const float* p = in_buf + d * 2u;
+        for (u32 i = 0; i < WSOLA_OVL; i += 4u) {
+            const float a = prev_ovl[i * 2u] + prev_ovl[i * 2u + 1u];
+            const float b = p[i * 2u] + p[i * 2u + 1u];
+            num += a * b;
+            ec  += b * b;
+        }
+        const float score = (ec > 1e-8f) ? (num / sqrtf(e_prev * ec)) : 0.0f;
+        if (score > best_score) { best_score = score; best_d = d; }
+    }
+    /* Fine refinement +/-3 around coarse peak (decimated by 2). */
+    const u32 lo = best_d > 3u ? best_d - 3u : 0u;
+    const u32 hi = (best_d + 3u <= max_seek) ? (best_d + 3u) : max_seek;
+    float e_prev2 = 0.0f;
+    for (u32 i = 0; i < WSOLA_OVL; i += 2u) {
+        const float m = prev_ovl[i * 2u] + prev_ovl[i * 2u + 1u];
+        e_prev2 += m * m;
+    }
+    best_score = -2.0f;
+    for (u32 d = lo; d <= hi; d++) {
+        float num = 0.0f, ec = 0.0f;
+        const float* p = in_buf + d * 2u;
+        for (u32 i = 0; i < WSOLA_OVL; i += 2u) {
+            const float a = prev_ovl[i * 2u] + prev_ovl[i * 2u + 1u];
+            const float b = p[i * 2u] + p[i * 2u + 1u];
+            num += a * b;
+            ec  += b * b;
+        }
+        const float score = (ec > 1e-8f) ? (num / sqrtf(e_prev2 * ec)) : 0.0f;
+        if (score > best_score) { best_score = score; best_d = d; }
+    }
+    return best_d;
+}
+
+static void audio_ts_set_tempo(float new_tempo)
+{
+    if (new_tempo < 0.50f) new_tempo = 0.50f;
+    if (new_tempo > 1.00f) new_tempo = 1.00f;
+    s_wsola.tempo = new_tempo;
+}
+
+static void audio_ts_push_and_drain(const float* block_256)
+{
+    if (!s_wsola.inited) audio_ts_init();
+
+    if (!s_wsola.active) {
+        if (s_wsola.tempo >= 0.992f) {
+            /* Zero-latency, zero-CPU passthrough at 1.00x. */
+            audio_ts_emit_raw(block_256, CELL_AUDIO_BLOCK_SAMPLES);
+            return;
+        }
+        /* Engage WSOLA seamlessly: prev_ovl is seeded with the UNPLAYED start of
+         * block_256, which is exact sample-for-sample continuation of the last
+         * passthrough sample, so hop 1 starts with zero discontinuity. */
+        memcpy(s_wsola.prev_ovl, block_256, WSOLA_OVL * 2u * sizeof(float));
+        s_wsola.active = 1;
+        s_wsola.in_len = 0;
+        s_wsola.in_frac = 0.0;
+    }
+
+    /* Append incoming 256-frame block into WSOLA FIFO. */
+    if (s_wsola.in_len + CELL_AUDIO_BLOCK_SAMPLES > WSOLA_IN_CAP) {
+        const u32 drop = (s_wsola.in_len + CELL_AUDIO_BLOCK_SAMPLES) - WSOLA_IN_CAP;
+        memmove(s_wsola.in_buf, s_wsola.in_buf + drop * 2u,
+                (s_wsola.in_len - drop) * 2u * sizeof(float));
+        s_wsola.in_len -= drop;
+    }
+    memcpy(s_wsola.in_buf + s_wsola.in_len * 2u, block_256,
+           CELL_AUDIO_BLOCK_SAMPLES * 2u * sizeof(float));
+    s_wsola.in_len += CELL_AUDIO_BLOCK_SAMPLES;
+
+    /* Run WSOLA synthesis hops while enough lookahead is available. */
+    while (s_wsola.in_len >= WSOLA_SEQ + WSOLA_SEEK) {
+        const u32 d = audio_ts_best_offset(s_wsola.prev_ovl, s_wsola.in_buf, WSOLA_SEEK);
+        const float* seg = s_wsola.in_buf + d * 2u;
+        for (u32 i = 0; i < WSOLA_OVL; i++) {
+            const float w = s_wsola.hann[i];
+            const float iw = 1.0f - w;
+            s_wsola.out_buf[i * 2u + 0u] = s_wsola.prev_ovl[i * 2u + 0u] * iw + seg[i * 2u + 0u] * w;
+            s_wsola.out_buf[i * 2u + 1u] = s_wsola.prev_ovl[i * 2u + 1u] * iw + seg[i * 2u + 1u] * w;
+        }
+        memcpy(s_wsola.out_buf + WSOLA_OVL * 2u, seg + WSOLA_OVL * 2u,
+               (WSOLA_HOP_OUT - WSOLA_OVL) * 2u * sizeof(float));
+        memcpy(s_wsola.prev_ovl, seg + WSOLA_HOP_OUT * 2u, WSOLA_OVL * 2u * sizeof(float));
+        audio_ts_emit_raw(s_wsola.out_buf, WSOLA_HOP_OUT);
+
+        const double step_d = (double)WSOLA_HOP_OUT * (double)s_wsola.tempo + s_wsola.in_frac;
+        u32 adv = (u32)step_d;
+        s_wsola.in_frac = step_d - (double)adv;
+        if (adv > s_wsola.in_len) adv = s_wsola.in_len;
+        if (adv > 0u) {
+            memmove(s_wsola.in_buf, s_wsola.in_buf + adv * 2u,
+                    (s_wsola.in_len - adv) * 2u * sizeof(float));
+            s_wsola.in_len -= adv;
+        }
+    }
+
+    /* Smoothly exit back to zero-latency passthrough once tempo returns to 1.00x. */
+    if (s_wsola.tempo >= 0.995f) {
+        if (s_wsola.in_len > 0u) {
+            u32 d = 0u;
+            if (s_wsola.in_len > WSOLA_OVL) {
+                const u32 avail_seek = s_wsola.in_len - WSOLA_OVL;
+                const u32 max_seek = avail_seek < WSOLA_SEEK ? avail_seek : WSOLA_SEEK;
+                d = audio_ts_best_offset(s_wsola.prev_ovl, s_wsola.in_buf, max_seek);
+            }
+            const u32 rem = s_wsola.in_len - d;
+            float* tail = s_wsola.in_buf + d * 2u;
+            const u32 ovl = rem < WSOLA_OVL ? rem : WSOLA_OVL;
+            for (u32 i = 0; i < ovl; i++) {
+                const float w = s_wsola.hann[i];
+                const float iw = 1.0f - w;
+                tail[i * 2u + 0u] = s_wsola.prev_ovl[i * 2u + 0u] * iw + tail[i * 2u + 0u] * w;
+                tail[i * 2u + 1u] = s_wsola.prev_ovl[i * 2u + 1u] * iw + tail[i * 2u + 1u] * w;
+            }
+            audio_ts_emit_raw(tail, rem);
+            s_wsola.in_len = 0;
+        } else {
+            audio_ts_emit_raw(s_wsola.prev_ovl, WSOLA_OVL);
+        }
+        s_wsola.active = 0;
+        s_wsola.in_frac = 0.0;
+    }
 }
 
 #endif /* AUDIO_BACKEND_AAUDIO */
@@ -693,6 +978,195 @@ static inline float ld_be_f32(const float* p)
     return f;
 }
 
+static inline u32 rd_raw_u32(const float* p)
+{
+    u32 v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+static inline void wr_raw_u32(float* p, u32 v)
+{
+    memcpy(p, &v, 4);
+}
+
+static u32 s_mix_holes_total = 0;
+
+#if AUDIO_BACKEND_AAUDIO
+/* ARMSX3/RPCS3 -0.0f completion tag positions (diagonal across channels +
+ * front-right marks on 8ch ports to detect stereo-in-8ch titles). */
+static inline void audio_port_tag_geometry(u32 nch, u32* first_pos, u32* delta)
+{
+    const u32 last = nch * CELL_AUDIO_BLOCK_SAMPLES - 1u;
+    *delta     = last / (AUDIO_PORT_TAG_COUNT - 1u);
+    *first_pos = last % (AUDIO_PORT_TAG_COUNT - 1u);
+}
+
+static inline u32 audio_port_mark_pos(u32 nch, u32 tag_nr)
+{
+    const u32 delta_sample = (CELL_AUDIO_BLOCK_SAMPLES - 1u) / (AUDIO_PORT_TAG_COUNT - 1u);
+    return tag_nr * delta_sample * nch + 1u; /* channel 1 = front right */
+}
+
+static void audio_port_tag_block(AudioPortSlot* port, float* blk)
+{
+    const u32 nch = (u32)port->param.nChannel;
+    if (!blk || !nch) return;
+
+    u32 tag_first = 0, tag_delta = 0;
+    audio_port_tag_geometry(nch, &tag_first, &tag_delta);
+
+    for (u32 tag_pos = tag_first, tag_nr = 0; tag_nr < AUDIO_PORT_TAG_COUNT; tag_pos += tag_delta, tag_nr++) {
+        wr_raw_u32(&blk[tag_pos], AUDIO_NEG_ZERO_BE_BITS);
+        port->last_tag_bits[tag_nr] = AUDIO_NEG_ZERO_BE_BITS;
+    }
+
+    if (nch != 2u) {
+        for (u32 tag_nr = 0; tag_nr < AUDIO_PORT_TAG_COUNT; tag_nr++) {
+            wr_raw_u32(&blk[audio_port_mark_pos(nch, tag_nr)], AUDIO_NEG_ZERO_BE_BITS);
+        }
+    }
+
+    port->prev_touched_tag_nr = 0xFFFFFFFFu;
+}
+
+static void audio_port_tag_all_blocks(AudioPortSlot* port)
+{
+    if (!port || !port->buffer || !port->param.nChannel || !port->param.nBlock) return;
+    const u32 nch = (u32)port->param.nChannel;
+    const u32 nblock = (u32)port->param.nBlock;
+    const u32 stride = CELL_AUDIO_BLOCK_SAMPLES * nch;
+    for (u32 b = 0; b < nblock; b++) {
+        audio_port_tag_block(port, port->buffer + b * stride);
+    }
+    port->periods_without_tag = 0;
+    port->front_only_port = 0;
+    port->front_only_reported = 0;
+}
+
+/* ARMSX3 count_port_buffer_tags(): inspects current read block of every active
+ * port to classify whether guest SPU/PPU finished writing it, is mid-write,
+ * or has not touched it yet. Never reads an empty/half-written block. */
+static void audio_check_port_tags(u32* out_active, u32* out_in_prog,
+                                  u32* out_untouched, u32* out_incomplete)
+{
+    u32 active = 0, in_prog = 0, untouched = 0, incomplete = 0;
+
+    mutex_lock(&s_audio_mutex);
+    for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++) {
+        AudioPortSlot* port = &s_ports[p];
+        if (!port->in_use || !port->running || !port->buffer) continue;
+        active++;
+
+        const u32 nch = (u32)port->param.nChannel;
+        const u32 nblock = (u32)port->param.nBlock;
+        if (!nch || !nblock) continue;
+
+        const u32 block_idx = (u32)(port->read_index % nblock);
+        const float* blk = port->buffer + block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
+
+        u32 tag_first = 0, tag_delta = 0;
+        audio_port_tag_geometry(nch, &tag_first, &tag_delta);
+
+        u32 last_touched = port->prev_touched_tag_nr;
+        int retouched = 0;
+        int tag_moved = 0;
+
+        for (u32 tag_pos = tag_first, tag_nr = 0; tag_nr < AUDIO_PORT_TAG_COUNT; tag_pos += tag_delta, tag_nr++) {
+            const u32 bits = rd_raw_u32(&blk[tag_pos]);
+            const u32 prev = port->last_tag_bits[tag_nr];
+            /* Match IEEE-754 value change OR -0.0f -> +0.0f sign-bit clear. */
+            if (bits != prev && !(bits == AUDIO_NEG_ZERO_BE_BITS && prev == 0x00000000u)) {
+                port->last_tag_bits[tag_nr] = bits;
+                if (port->prev_touched_tag_nr != 0xFFFFFFFFu && tag_nr <= port->prev_touched_tag_nr)
+                    retouched = 1;
+                last_touched = tag_nr;
+                tag_moved = 1;
+            }
+        }
+
+        if (tag_moved) {
+            port->periods_without_tag = 0;
+            port->front_only_port = 0;
+        }
+
+        if (last_touched == 0xFFFFFFFFu) {
+            if (!port->front_only_port && nch != 2u && port->periods_without_tag > AUDIO_FRONT_ONLY_SETTLE) {
+                for (u32 tag_nr = 0; tag_nr < AUDIO_PORT_TAG_COUNT; tag_nr++) {
+                    const u32 mbits = rd_raw_u32(&blk[audio_port_mark_pos(nch, tag_nr)]);
+                    if (mbits != AUDIO_NEG_ZERO_BE_BITS) {
+                        port->front_only_port = 1;
+                        break;
+                    }
+                }
+                if (port->front_only_port && !port->front_only_reported) {
+                    port->front_only_reported = 1;
+                    fprintf(stderr, "[cellAudio] Port %d carries front-channel audio only (nch=%u); tracking front-right marks\n",
+                            p, nch);
+                }
+            }
+
+            if (!port->front_only_port) {
+                untouched++;
+            } else {
+                /* Front-only 8ch port: verify at least one front-right mark moved
+                 * so late writes still wait cleanly instead of producing holes. */
+                int any_mark = 0;
+                int last_mark = 0;
+                for (u32 tag_nr = 0; tag_nr < AUDIO_PORT_TAG_COUNT; tag_nr++) {
+                    const u32 mbits = rd_raw_u32(&blk[audio_port_mark_pos(nch, tag_nr)]);
+                    if (mbits != AUDIO_NEG_ZERO_BE_BITS) {
+                        any_mark = 1;
+                        if (tag_nr == AUDIO_PORT_TAG_COUNT - 1u) last_mark = 1;
+                    }
+                }
+                if (!any_mark) untouched++;
+                else if (!last_mark) in_prog++;
+                else incomplete++;
+            }
+        } else if (last_touched == AUDIO_PORT_TAG_COUNT - 1u) {
+            if (retouched) in_prog++;
+            port->prev_touched_tag_nr = last_touched;
+        } else if (last_touched == port->prev_touched_tag_nr) {
+            if (retouched) in_prog++;
+            else incomplete++;
+        } else {
+            in_prog++;
+            port->prev_touched_tag_nr = last_touched;
+        }
+    }
+    mutex_unlock(&s_audio_mutex);
+
+    *out_active     = active;
+    *out_in_prog    = in_prog;
+    *out_untouched  = untouched;
+    *out_incomplete = incomplete;
+}
+
+/* Advance read_index and re-tag current blocks without mixing (used on untouched
+ * timeout and steady-silence fast path, matching ARMSX3 advance()). */
+static void audio_advance_ports_silent(void)
+{
+    mutex_lock(&s_audio_mutex);
+    for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++) {
+        AudioPortSlot* port = &s_ports[p];
+        if (!port->in_use || !port->running || !port->buffer) continue;
+        const u32 nch = (u32)port->param.nChannel;
+        const u32 nblock = (u32)port->param.nBlock;
+        if (!nch || !nblock) continue;
+        const u32 block_idx = (u32)(port->read_index % nblock);
+        float* src = port->buffer + block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
+        memset(src, 0, CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float));
+        audio_port_tag_block(port, src);
+        if (port->periods_without_tag < 0xFFu) port->periods_without_tag++;
+        port->read_index++;
+        if (port->read_idx_addr)
+            vm_write64((u32)port->read_idx_addr, port->read_index % nblock);
+    }
+    mutex_unlock(&s_audio_mutex);
+}
+#endif /* AUDIO_BACKEND_AAUDIO */
+
 /* Mix one block from all active ports into s_mix_buffer (stereo float) */
 static void audio_mix_one_block(void)
 {
@@ -711,7 +1185,7 @@ static void audio_mix_one_block(void)
                 u32 probe = (u32)(port->param.nBlock * CELL_AUDIO_BLOCK_SAMPLES *
                                   port->param.nChannel);
                 int nz = 0;
-                for (u32 s = 0; s < probe; s += 64) if (port->buffer[s] != 0.0f) { nz = 1; break; }
+                for (u32 s = 0; s < probe; s += 64) if (ld_be_f32(&port->buffer[s]) != 0.0f) { nz = 1; break; }
                 if (nz) {
                     warned[p] = 1;
                     fprintf(stderr, "[cellAudio] port %d HAS DATA but never started"
@@ -744,7 +1218,7 @@ static void audio_mix_one_block(void)
                     const float* bp = port->buffer + b * CELL_AUDIO_BLOCK_SAMPLES * nch;
                     int nz = 0;
                     for (u32 s2 = 0; s2 < CELL_AUDIO_BLOCK_SAMPLES * nch; s2 += 16)
-                        if (bp[s2] != 0.0f) { nz = 1; break; }
+                        if (ld_be_f32(&bp[s2]) != 0.0f) { nz = 1; break; }
                     map[b] = nz ? '#' : '.';
                 }
                 map[b] = 0;
@@ -794,6 +1268,10 @@ static void audio_mix_one_block(void)
          * preventing stale PCM from replaying when a producer stalls, the
          * cleared block is an observable consumption signal for producers. */
         memset(src, 0, CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float));
+#if AUDIO_BACKEND_AAUDIO
+        audio_port_tag_block(port, src);
+        if (port->periods_without_tag < 0xFFu) port->periods_without_tag++;
+#endif
 
         /* Keep the monotonic counter for tags/timestamps, but publish the
          * ring slot to the guest. SurMixer multiplies this value by the block
@@ -813,7 +1291,6 @@ static void audio_mix_one_block(void)
         static float s_mix_prev_r = 0.0f;
         static u32   s_mix_hole_streak = 0;
         static int   s_mix_was_active  = 0;
-        static u32   s_mix_holes_total = 0;
         float block_peak = 0.0f;
 
         for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2u; i++) {
@@ -880,23 +1357,6 @@ static void audio_mix_one_block(void)
             s_mix_prev_r = s_mix_buffer[(CELL_AUDIO_BLOCK_SAMPLES - 1u) * 2u + 1u];
             s_mix_was_active = (block_peak > 1e-4f) ? 1 : 0;
         }
-#if AUDIO_BACKEND_AAUDIO
-        {
-            static u32 s_stat_blocks = 0;
-            static u32 s_last_ur = 0, s_last_holes = 0;
-            if (++s_stat_blocks % 5625u == 0u) { /* ~30 s */
-                const u32 ur = __atomic_load_n(&s_aa_underruns, __ATOMIC_RELAXED);
-                if (ur != s_last_ur || s_mix_holes_total != s_last_holes || g_audio_dropped) {
-                    fprintf(stderr, "[cellAudio] 30s stats: underruns=%u (+%u) holes=%u (+%u) dropped=%llu q=%u blk\n",
-                            ur, ur - s_last_ur, s_mix_holes_total, s_mix_holes_total - s_last_holes,
-                            (unsigned long long)g_audio_dropped,
-                            audio_backend_queued_samples() / CELL_AUDIO_BLOCK_SAMPLES);
-                    s_last_ur = ur;
-                    s_last_holes = s_mix_holes_total;
-                }
-            }
-        }
-#endif
     }
 }
 
@@ -919,6 +1379,7 @@ static void audio_notify_event_queues(void)
     }
 }
 
+#if !AUDIO_BACKEND_AAUDIO
 /* The loudest sample of the block just mixed (AUDIO_PEAK). */
 static float audio_mix_peak(void)
 {
@@ -929,6 +1390,7 @@ static float audio_mix_peak(void)
     }
     return pk;
 }
+#endif
 
 /* AUDIO_WAV=<file>: append the final mix as raw f32le stereo 48 kHz
  * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
@@ -1170,6 +1632,301 @@ u32 cellAudio_coop_read_adpcm(u8* out_buf, u32 max_bytes, u32* out_frames)
     return 8u + COOP_AUDIO_CHUNK_FRAMES;
 }
 
+#if AUDIO_BACKEND_AAUDIO
+static inline u64 audio_clock_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000ULL + (u64)ts.tv_nsec / 1000ULL;
+}
+
+static inline void audio_sleep_until_us(u64 target_us)
+{
+    const struct timespec dl = {
+        (time_t)(target_us / 1000000ULL),
+        (long)((target_us % 1000000ULL) * 1000ULL)
+    };
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &dl, NULL) == EINTR) {}
+}
+
+static inline void audio_sleep_rel_us(u64 dur_us)
+{
+    audio_sleep_until_us(audio_clock_us() + dur_us);
+}
+
+static void audio_pin_fast_cores(void)
+{
+#if defined(__linux__)
+    unsigned long freqs[16];
+    unsigned long max_freq = 0;
+    int n_cpus = 0;
+    for (int i = 0; i < 16; i++) {
+        freqs[i] = 0;
+        char path[96];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        unsigned long khz = 0;
+        if (fscanf(f, "%lu", &khz) == 1 && khz > 0) {
+            freqs[i] = khz;
+            if (khz > max_freq) max_freq = khz;
+            n_cpus = i + 1;
+        }
+        fclose(f);
+    }
+    if (max_freq == 0 || n_cpus < 3) return;
+    const unsigned long thresh = (max_freq * 3u) / 4u;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    int fast_cnt = 0;
+    for (int i = 0; i < n_cpus; i++) {
+        if (freqs[i] >= thresh) {
+            CPU_SET(i, &set);
+            fast_cnt++;
+        }
+    }
+    if (fast_cnt >= 2 && sched_setaffinity(0, sizeof(set), &set) == 0) {
+        fprintf(stderr, "[cellAudio] mix thread pinned to %d fast core(s) (>=%lu MHz)\n",
+                fast_cnt, thresh / 1000ul);
+    }
+#endif
+}
+
+static inline void audio_note_untouched(u32 count, u32 ports,
+                                        u32* untouched_expected,
+                                        u32* untouched_below_streak)
+{
+    if (*untouched_expected > ports) *untouched_expected = ports;
+    const u32 capped = count < ports ? count : ports;
+    if (capped >= *untouched_expected || ++(*untouched_below_streak) >= 8u) {
+        *untouched_expected = capped;
+        *untouched_below_streak = 0;
+    }
+}
+
+static void* audio_mix_thread_func(void* arg)
+{
+    (void)arg;
+    ps3_thread_name("audio mix");
+#if defined(__linux__)
+    if (setpriority(PRIO_PROCESS, 0, -16) != 0)
+        (void)setpriority(PRIO_PROCESS, 0, -10);
+#endif
+    audio_pin_fast_cores();
+    audio_ts_init();
+
+    float ts_thresh = 0.75f;
+    {
+        const char* e = getenv("PS3_AUDIO_TS_THRESH");
+        if (e && *e) {
+            const int v = atoi(e);
+            if (v <= 0) ts_thresh = 0.0f;
+            else if (v <= 95) ts_thresh = (float)v * 0.01f;
+        }
+    }
+
+    const u64 block_period_us = 5333ULL; /* 256 / 48000 s */
+    const u64 min_period_us   = 2666ULL; /* 50% nominal (ARMSX3) */
+    const u64 max_period_us   = 6399ULL; /* 120% nominal (ARMSX3) */
+    const float avg_alpha     = 0.02f;
+    static const float zero_block[CELL_AUDIO_BLOCK_SAMPLES * 2u] = { 0 };
+
+    u64 last_period_end_us = audio_clock_us();
+    u64 last_report_us     = last_period_end_us;
+    float avg_playtime_us  = (float)s_aa_desired_ms * 1000.0f;
+    u32 untouched_expected = 0;
+    u32 untouched_below_streak = 0;
+    u32 loop_count = 0;
+    u32 waited_tags = 0;
+    u32 timedout_tags = 0;
+    u32 last_ur = __atomic_load_n(&s_aa_underruns, __ATOMIC_RELAXED);
+    u32 last_holes = s_mix_holes_total;
+    int backend_failed = 0;
+
+    printf("[cellAudio] Mixing thread started (ARMSX3 dynamic period + -0.0f tags + WSOLA thresh=%.0f%%)\n",
+           (double)ts_thresh * 100.0);
+
+    while (s_mix_thread_running) {
+        loop_count++;
+
+        /* Periodic AAudio disconnect/error recovery (e.g. headphones/BT switch). */
+        const u32 check_mask = backend_failed ? 255u : 63u;
+        if ((loop_count & check_mask) == 0u) {
+            const int op = audio_backend_is_operational();
+            if (!op) {
+                if (!backend_failed) {
+                    fprintf(stderr, "[cellAudio] AAudio backend stopped/disconnected; attempting auto-recovery...\n");
+                    backend_failed = 1;
+                }
+                audio_backend_shutdown();
+                if (audio_backend_open_aaudio(0) == 0 && audio_backend_is_operational()) {
+                    fprintf(stderr, "[cellAudio] AAudio backend recovered\n");
+                    backend_failed = 0;
+                }
+            } else if (backend_failed) {
+                fprintf(stderr, "[cellAudio] AAudio backend recovered\n");
+                backend_failed = 0;
+            }
+        }
+
+        const u64 now_us = audio_clock_us();
+        const u64 time_since_last = now_us >= last_period_end_us ? (now_us - last_period_end_us) : 0ULL;
+        const u64 desired_us = (u64)s_aa_desired_ms * 1000ULL;
+        const int has_stream = (s_aa_stream != NULL);
+
+        const u32 enqueued_frames = has_stream
+            ? (audio_backend_queued_samples() + audio_ts_queued_out_frames())
+            : 0u;
+        const u64 enqueued_playtime_us = ((u64)enqueued_frames * 1000000ULL) / CELL_AUDIO_SAMPLE_RATE;
+
+        u32 active_ports = 0, in_prog = 0, untouched = 0, incomplete = 0;
+        audio_check_port_tags(&active_ports, &in_prog, &untouched, &incomplete);
+        (void)incomplete;
+
+        /* ARMSX3 fixed rolling average ratio (avg_playtime_us / desired_us)
+         * widens the effective target buffer when sustained stalls drain the ring. */
+        const float avg_ratio = (has_stream && desired_us) ? (avg_playtime_us / (float)desired_us) : 1.0f;
+        float desired_adj = (float)desired_us + ((float)block_period_us * 0.5f);
+        if (avg_ratio < 1.0f) {
+            const float denom = avg_ratio > 0.35f ? avg_ratio : 0.35f;
+            desired_adj /= denom;
+            if (desired_adj > 160000.0f) desired_adj = 160000.0f;
+        }
+
+        const float rate = (has_stream && desired_adj > 1.0f)
+            ? ((float)enqueued_playtime_us / desired_adj) : 1.0f;
+
+        /* ARMSX3 adaptive WSOLA time-stretching (engaged only below threshold). */
+        if (has_stream && ts_thresh > 0.0f && active_ports > 0u) {
+            if (rate < ts_thresh) {
+                const float norm = rate / ts_thresh;
+                float req = (norm + s_wsola.tempo) * 0.5f;
+                if (req < 0.50f) req = 0.50f;
+                if (fabsf(req - s_wsola.tempo) > 0.025f)
+                    audio_ts_set_tempo(req);
+            } else if (s_wsola.tempo < 1.0f) {
+                float next_t = s_wsola.tempo + 0.03f;
+                if (next_t >= 0.995f) next_t = 1.0f;
+                audio_ts_set_tempo(next_t);
+            }
+        } else if (s_wsola.tempo < 1.0f) {
+            audio_ts_set_tempo(1.0f);
+        }
+
+        /* ARMSX3 dynamic block period controller ([50%, 120%] of 5.33 ms). */
+        u64 dyn_period_us;
+        if (!has_stream) {
+            dyn_period_us = block_period_us;
+        } else if (rate >= 1.0f) {
+            const float mult = 1.0f / rate;
+            dyn_period_us = max_period_us - (u64)((float)(max_period_us - block_period_us) * mult);
+        } else {
+            const float mult = rate * rate;
+            dyn_period_us = min_period_us + (u64)((float)(block_period_us - min_period_us) * mult);
+        }
+
+        /* ARMSX3 10-second buffer telemetry (delta underruns/holes, not boot totals). */
+        if (now_us >= last_report_us + 10000000ULL) {
+            last_report_us = now_us;
+            const u32 ur_now = __atomic_load_n(&s_aa_underruns, __ATOMIC_RELAXED);
+            const u32 ur_delta = ur_now >= last_ur ? (ur_now - last_ur) : ur_now;
+            last_ur = ur_now;
+            const u32 holes_now = s_mix_holes_total;
+            const u32 holes_delta = holes_now - last_holes;
+            last_holes = holes_now;
+            fprintf(stderr,
+                    "[cellAudio] Audio buffer: queued=%.1fms target=%.1fms (%.0f%%) period=%.0f%% "
+                    "ports=%u untouched=%u avg=%.2f tempo=%.2f underruns=%u holes=%u waited=%u timeout=%u dropped=%llu\n",
+                    (double)enqueued_playtime_us / 1000.0,
+                    (double)desired_adj / 1000.0,
+                    (double)rate * 100.0,
+                    (double)dyn_period_us * 100.0 / (double)block_period_us,
+                    active_ports, untouched, (double)avg_ratio, (double)s_wsola.tempo,
+                    ur_delta, holes_delta, waited_tags, timedout_tags,
+                    (unsigned long long)g_audio_dropped);
+            waited_tags = 0;
+            timedout_tags = 0;
+            {
+                extern void android_watchdog_poll(void) __attribute__((weak));
+                if (android_watchdog_poll) android_watchdog_poll();
+            }
+        }
+
+        if (time_since_last + 150ULL < dyn_period_us) {
+            audio_sleep_until_us(last_period_end_us + dyn_period_us - 100ULL);
+            continue;
+        }
+
+        /* Fast path: 0 active ports -> feed silence at nominal cadence. */
+        if (active_ports == 0u) {
+            audio_ts_push_and_drain(zero_block);
+            untouched_expected = 0;
+            untouched_below_streak = 0;
+            last_period_end_us = audio_clock_us();
+            const u64 post_us = ((u64)(audio_backend_queued_samples() + audio_ts_queued_out_frames()) * 1000000ULL) / CELL_AUDIO_SAMPLE_RATE;
+            avg_playtime_us = avg_alpha * (float)post_us + (1.0f - avg_alpha) * avg_playtime_us;
+            audio_notify_event_queues();
+            continue;
+        }
+
+        /* ARMSX3 -0.0f completion tag wait: never read a block before task_audio writes it. */
+        if (untouched > untouched_expected) {
+            const u64 fully_timeout = (enqueued_playtime_us >= 20000ULL)
+                                    ? (block_period_us * 3ULL) : (block_period_us * 2ULL);
+            const u64 partial_timeout = block_period_us * 4ULL;
+            if ((untouched == active_ports && time_since_last > fully_timeout) ||
+                (time_since_last > partial_timeout)) {
+                /* Timed out waiting for guest: advance read_index WITHOUT pushing
+                 * a silence gap into AAudio (ARMSX3 cellAudio.cpp:1199). */
+                timedout_tags++;
+                audio_note_untouched(untouched, active_ports, &untouched_expected, &untouched_below_streak);
+                audio_advance_ports_silent();
+                last_period_end_us = audio_clock_us();
+                const u64 post_us = ((u64)(audio_backend_queued_samples() + audio_ts_queued_out_frames()) * 1000000ULL) / CELL_AUDIO_SAMPLE_RATE;
+                avg_playtime_us = avg_alpha * (float)post_us + (1.0f - avg_alpha) * avg_playtime_us;
+                audio_notify_event_queues();
+                continue;
+            }
+            waited_tags++;
+            audio_sleep_rel_us(1000ULL);
+            continue;
+        }
+
+        /* Fast path: steady silence (e.g. pause menu / loading screen). */
+        if (untouched == active_ports) {
+            audio_ts_push_and_drain(zero_block);
+            audio_note_untouched(untouched, active_ports, &untouched_expected, &untouched_below_streak);
+            audio_advance_ports_silent();
+            last_period_end_us = audio_clock_us();
+            const u64 post_us = ((u64)(audio_backend_queued_samples() + audio_ts_queued_out_frames()) * 1000000ULL) / CELL_AUDIO_SAMPLE_RATE;
+            avg_playtime_us = avg_alpha * (float)post_us + (1.0f - avg_alpha) * avg_playtime_us;
+            audio_notify_event_queues();
+            continue;
+        }
+
+        /* Wait briefly if a port is mid-write (prevents half-written block crackles). */
+        if (in_prog > 0u && time_since_last <= block_period_us * 4ULL) {
+            waited_tags++;
+            audio_sleep_rel_us(500ULL);
+            continue;
+        }
+
+        audio_note_untouched(untouched, active_ports, &untouched_expected, &untouched_below_streak);
+        audio_mix_one_block();
+        audio_dump_mix();
+        audio_ts_push_and_drain(s_mix_buffer);
+        audio_notify_event_queues();
+        last_period_end_us = audio_clock_us();
+        {
+            const u64 post_us = ((u64)(audio_backend_queued_samples() + audio_ts_queued_out_frames()) * 1000000ULL) / CELL_AUDIO_SAMPLE_RATE;
+            avg_playtime_us = avg_alpha * (float)post_us + (1.0f - avg_alpha) * avg_playtime_us;
+        }
+    }
+
+    printf("[cellAudio] Mixing thread stopped\n");
+    return NULL;
+}
+#else
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
@@ -1240,6 +1997,7 @@ static void* audio_mix_thread_func(void* arg)
     printf("[cellAudio] Mixing thread stopped\n");
     return NULL;
 }
+#endif /* AUDIO_BACKEND_AAUDIO */
 #endif
 
 static int audio_start_mix_thread(void)
@@ -1424,6 +2182,9 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
 
     port->buffer = (float*)(vm_base + guest_buf);     /* host view of guest buffer */
     memset(port->buffer, 0, port->buf_size);
+#if AUDIO_BACKEND_AAUDIO
+    audio_port_tag_all_blocks(port);
+#endif
     vm_write64(guest_ridx, 0);                        /* read index counter (u64, see below) */
 
     port->port_addr     = guest_buf;
@@ -1479,6 +2240,14 @@ s32 cellAudioPortStart(u32 portNum)
 
     mutex_lock(&s_audio_mutex);
     s_ports[portNum].running = 1;
+#if AUDIO_BACKEND_AAUDIO
+    s_ports[portNum].periods_without_tag = 0;
+    s_ports[portNum].front_only_port = 0;
+    s_ports[portNum].front_only_reported = 0;
+    s_ports[portNum].prev_touched_tag_nr = 0xFFFFFFFFu;
+    for (u32 t = 0; t < AUDIO_PORT_TAG_COUNT; t++)
+        s_ports[portNum].last_tag_bits[t] = AUDIO_NEG_ZERO_BE_BITS;
+#endif
     mutex_unlock(&s_audio_mutex);
 
     return CELL_OK;

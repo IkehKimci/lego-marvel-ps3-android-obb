@@ -2,7 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.ps3recomp.legomarvel"
     android:versionCode="2"
-    android:versionName="0.2.4-BLUS31161">
+    android:versionName="0.2.7-BLUS31161">
 
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
 

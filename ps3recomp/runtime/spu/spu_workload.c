@@ -21,6 +21,7 @@
 #include <errno.h>
 #ifdef __ANDROID__
 #include <sys/resource.h>
+#include <sched.h>
 #endif
 #include "../platform/win32_compat.h"   /* LONG, InterlockedExchange, Sleep */
 #include "spu_task_pool.h"              /* PS3RECOMP_SPU_TASK_POOL */
@@ -1562,9 +1563,39 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
 #ifdef __ANDROID__
     static _Thread_local unsigned s_wait_calls;
     if (++s_wait_calls == 16u) {
-        /* Persistent SPURS loop (e.g. task_audio / video decode): keep it ahead of
-         * normal threads and background shader compilation workers. */
-        (void)setpriority(PRIO_PROCESS, 0, -8);
+        /* Persistent SPURS loop (e.g. task_audio / video decode): raise priority
+         * and steer onto big/prime cores (ARMSX3 big.LITTLE scheduling) so Android
+         * EAS never strands audio mixing on throttled efficiency cores. */
+        if (setpriority(PRIO_PROCESS, 0, -12) != 0)
+            (void)setpriority(PRIO_PROCESS, 0, -8);
+        unsigned long freqs[32] = {0};
+        unsigned long max_f = 0, min_f = ~0ul;
+        int ncpu = 0;
+        for (int c = 0; c < 32; c++) {
+            char p[96];
+            snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+            FILE* fp = fopen(p, "r");
+            if (!fp) continue;
+            unsigned long f = 0;
+            if (fscanf(fp, "%lu", &f) == 1 && f > 0) {
+                freqs[c] = f;
+                if (f > max_f) max_f = f;
+                if (f < min_f) min_f = f;
+                ncpu++;
+            }
+            fclose(fp);
+        }
+        if (ncpu >= 4 && max_f > min_f) {
+            cpu_set_t mask;
+            CPU_ZERO(&mask);
+            int fast_cnt = 0;
+            const unsigned long thresh = (max_f * 3ul) / 4ul; /* >= 75% of prime freq */
+            for (int c = 0; c < 32; c++) {
+                if (freqs[c] >= thresh) { CPU_SET(c, &mask); fast_cnt++; }
+            }
+            if (fast_cnt >= 2 && fast_cnt < ncpu)
+                (void)sched_setaffinity(0, sizeof mask, &mask);
+        }
     }
 #endif
     { extern unsigned long long ps3_ms_now(void);

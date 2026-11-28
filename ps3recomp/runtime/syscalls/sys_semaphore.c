@@ -491,39 +491,67 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
         /* loop: re-check value */
     }
 #else
-    pthread_mutex_lock(&s->mtx);
+    {
+        extern int  ppu_gcm_has_pending(void) __attribute__((weak));
+        extern void ppu_gcm_pump(void)        __attribute__((weak));
+        pthread_mutex_lock(&s->mtx);
 
-    if (timeout_us == 0) {
-        while (s->value <= 0) {
-            s->waiters++;
-            SEM_TEST_HOOK("sem.wait.registered", sem_id);
-            pthread_cond_wait(&s->cv, &s->mtx);
-            s->waiters--;
-        }
-    } else {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec  += (time_t)(timeout_us / 1000000);
-        ts.tv_nsec += (long)((timeout_us % 1000000) * 1000);
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-        while (s->value <= 0) {
-            s->waiters++;
-            int rc = pthread_cond_timedwait(&s->cv, &s->mtx, &ts);
-            s->waiters--;
-            if (rc == ETIMEDOUT) {
-                pthread_mutex_unlock(&s->mtx);
-                sem_operation_end(sem_id);
-                return (int64_t)(int32_t)CELL_ETIMEDOUT;
+        if (timeout_us == 0) {
+            unsigned waited_slices = 0;
+            while (s->value <= 0) {
+                if (ppu_gcm_pump && ppu_gcm_has_pending && ppu_gcm_has_pending()) {
+                    pthread_mutex_unlock(&s->mtx);
+                    ppu_gcm_pump();
+                    pthread_mutex_lock(&s->mtx);
+                    continue;
+                }
+                s->waiters++;
+                SEM_TEST_HOOK("sem.wait.registered", sem_id);
+                if (ppu_gcm_pump) {
+                    struct timespec sl;
+                    clock_gettime(CLOCK_REALTIME, &sl);
+                    sl.tv_nsec += 4000000L; /* 4 ms slice for VBlank/Flip pump */
+                    if (sl.tv_nsec >= 1000000000L) { sl.tv_sec++; sl.tv_nsec -= 1000000000L; }
+                    int rc = pthread_cond_timedwait(&s->cv, &s->mtx, &sl);
+                    s->waiters--;
+                    if (rc == ETIMEDOUT && s->value <= 0) {
+                        waited_slices++;
+                        if (waited_slices == 1500u || (waited_slices > 1500u && (waited_slices % 2500u) == 0u)) {
+                            fprintf(stderr, "[WATCHDOG][sem] tid=%llu waiting %us on sem_id=%u (val=%d max=%d waiters=%d lr=0x%08X)\n",
+                                    (unsigned long long)ctx->thread_id, (waited_slices * 4u) / 1000u,
+                                    sem_id, s->value, s->max_value, s->waiters + 1, (uint32_t)ctx->lr);
+                        }
+                    }
+                } else {
+                    pthread_cond_wait(&s->cv, &s->mtx);
+                    s->waiters--;
+                }
+            }
+        } else {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec  += (time_t)(timeout_us / 1000000);
+            ts.tv_nsec += (long)((timeout_us % 1000000) * 1000);
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec++;
+                ts.tv_nsec -= 1000000000L;
+            }
+            while (s->value <= 0) {
+                s->waiters++;
+                int rc = pthread_cond_timedwait(&s->cv, &s->mtx, &ts);
+                s->waiters--;
+                if (rc == ETIMEDOUT) {
+                    pthread_mutex_unlock(&s->mtx);
+                    sem_operation_end(sem_id);
+                    return (int64_t)(int32_t)CELL_ETIMEDOUT;
+                }
             }
         }
-    }
 
-    s->value--;
-    pthread_mutex_unlock(&s->mtx);
-    SEM_TEST_HOOK("sem.wait.after_wake", sem_id);
+        s->value--;
+        pthread_mutex_unlock(&s->mtx);
+        SEM_TEST_HOOK("sem.wait.after_wake", sem_id);
+    }
 #endif
 
     sem_operation_end(sem_id);

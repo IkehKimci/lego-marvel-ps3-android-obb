@@ -537,7 +537,19 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
     const int stats_on = interp_stats_on();
     const int debug_on = (_tr > 0) || (_g1 > 0) || stats_on;
     const int can_rejoin = (ctx->image_id >= 0);
-    uint32_t epoch = spu_icache_next_epoch();
+    static SPU_INTERP_TLS int t_last_img = -999;
+    static SPU_INTERP_TLS uint32_t t_last_res = 0xFFFFFFFFu;
+    static SPU_INTERP_TLS int t_last_ovl = -1;
+    static SPU_INTERP_TLS int t_last_task = -1;
+    uint32_t epoch = t_spu_icache_epoch;
+    if (SPU_UNLIKELY(ctx->image_id != t_last_img || ctx->dcache_residency != t_last_res ||
+                     ctx->resident_ovl != t_last_ovl || ctx->resident_task != t_last_task)) {
+        epoch = spu_icache_next_epoch();
+        t_last_img = ctx->image_id;
+        t_last_res = ctx->dcache_residency;
+        t_last_ovl = ctx->resident_ovl;
+        t_last_task = ctx->resident_task;
+    }
     const uint8_t* const ls = ctx->ls;
     for (;;) {
         const uint32_t pc = ctx->pc;

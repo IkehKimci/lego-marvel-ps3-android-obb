@@ -2757,6 +2757,21 @@ static struct {
     u8  spu_mask;     /* SPUs the priority table lets run the chain (0 = no table) */
 } s_jobchains[MAX_JOBCHAINS];
 
+void cellSpurs_debug_dump_stall(void)
+{
+    int any = 0;
+    for (int i = 0; i < MAX_JOBCHAINS; i++) {
+        if (s_jobchains[i].jc_ea && (s_jobchains[i].running || s_jobchains[i].kicked)) {
+            fprintf(stderr, "[WATCHDOG][spurs] jc[%d]=0x%08X run=%ld kicked=%ld pc=0x%08X runs=%d halted=%d\n",
+                    i, s_jobchains[i].jc_ea, (long)s_jobchains[i].running, (long)s_jobchains[i].kicked,
+                    s_jobchains[i].pc, s_jobchains[i].run_count, s_jobchains[i].halted);
+            any = 1;
+        }
+    }
+    if (!any)
+        fprintf(stderr, "[WATCHDOG][spurs] no active/running jobchains\n");
+}
+
 static void jc_dump_commands(const char* tag, u32 ea, int max_words)
 {
     printf("[cellSpurs] %s chain@0x%08X commands:", tag, ea);

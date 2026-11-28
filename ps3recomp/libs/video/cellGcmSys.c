@@ -1029,6 +1029,33 @@ static void gcm_intr_main(void* unused)
 #endif
 }
 
+int ppu_gcm_has_pending(void)
+{
+#ifdef _WIN32
+    return (s_gcm_pending != 0 || s_user_pending != 0) ? 1 : 0;
+#else
+    return (atomic_load_explicit(&s_gcm_pending, memory_order_relaxed) != 0 ||
+            atomic_load_explicit(&s_user_pending, memory_order_relaxed) != 0) ? 1 : 0;
+#endif
+}
+
+void cellGcm_debug_dump_stall(void)
+{
+    u32 put = vm_base ? vm_read32(GCM_CONTROL_GUEST_ADDR + 0) : 0;
+    u32 ref = vm_base ? vm_read32(GCM_CONTROL_GUEST_ADDR + 8) : 0;
+#ifdef _WIN32
+    int pend = (int)s_gcm_pending;
+    u64 upend = (u64)s_user_pending;
+#else
+    int pend = (int)atomic_load_explicit(&s_gcm_pending, memory_order_relaxed);
+    u64 upend = (u64)atomic_load_explicit(&s_user_pending, memory_order_relaxed);
+#endif
+    fprintf(stderr, "[WATCHDOG][gcm] get=0x%08X put=0x%08X ref=0x%08X flip_st=%u req=%u tick=%u fl_q=%u fl_r=%u fl_c=%u pend=%d user=%llu\n",
+            s_fifo_getoff, put, ref, s_flip_status, s_flip_req_seq, s_flip_tick_seq,
+            s_fifo_flips_queued, s_fifo_flips_reached, s_fifo_flips_completed,
+            pend, (unsigned long long)upend);
+}
+
 void ppu_gcm_pump(void)
 {
     /* Every HLE call and timer sleep pumps, tens of thousands of times a

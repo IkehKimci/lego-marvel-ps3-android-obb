@@ -2158,6 +2158,26 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
     }
 }
 
+/* Signature-matched relocatable code region (e.g. Sony MultiStream DSP plugins
+ * copied into a 12 KB-aligned heap table and DMA'd to dynamic LS addresses). */
+void spu_overlay_register_sig_reloc(const uint8_t sig[16], uint32_t span, uint32_t canon, int image_id)
+{
+    if (!sig || !span || !canon || canon >= SPU_LS_SIZE || span > SPU_LS_SIZE - canon) return;
+    { static int s_off = -1; if (s_off < 0) { const char* e = getenv("SPU_RELOC_OFF"); s_off = e && e[0] == '1'; }
+      if (s_off) return; }
+    if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
+        spu_ovl_src* o = &s_ovl_src[s_ovl_src_count];
+        memset(o, 0, sizeof *o);
+        o->image_id = image_id;
+        memcpy(o->sig, sig, 16);
+        o->has_sig = 1;
+        o->span = span;
+        o->canon = canon;
+        atomic_store_explicit(&s_ovl_has_sig, 1, memory_order_release);
+        __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
+    }
+}
+
 /* Called from the MFC GET path after the copy: ls points at the JUST-COPIED
  * bytes. EA match first (exact, cheap), then content signature for sizeable
  * chunks (overlay bodies are >= 0x500 bytes). */
@@ -2216,11 +2236,18 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
     spu_ovl_dump(ctx, ea, lsa, ls, size);
+    int all_same_reloc = 0;
     for (unsigned slot = 0; slot < 4; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;
         uint32_t end = base + ctx->resident_code[slot].size;
         if (lsa < end && lsa + size > base) {
+            if (ctx->resident_code[slot].canon && !ctx->resident_code[slot].verify_state &&
+                lsa <= base && lsa + size >= end &&
+                ctx->resident_code[slot].source_ea == ea + (base - lsa)) {
+                all_same_reloc++;
+                continue;
+            }
             if (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)) {
                 ctx->resident_code[slot].image_id = 0;
                 spu_dcache_residency_changed(ctx);
@@ -2237,15 +2264,123 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
      * signature can only force an unnecessary scan of the older snapshot. */
     if ((size < 512 || !atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire)) &&
         !spu_ovl_ea_known(ea)) return;
+
+    /* Fast-path: if the exact same (ea, lsa, size) DMA just re-delivered the
+     * exact same resident relocatable plugins without any change, skip scanning
+     * and keep the SPU dispatch cache completely warm! */
+    static SPU_TLS struct {
+        uint32_t ea, lsa, size, residency;
+        int nsrc, img;
+    } t_reloc_memo;
+    if (all_same_reloc > 0 &&
+        t_reloc_memo.ea == ea && t_reloc_memo.lsa == lsa &&
+        t_reloc_memo.size == size && t_reloc_memo.nsrc == nsrc &&
+        t_reloc_memo.img == ctx->image_id &&
+        t_reloc_memo.residency == ctx->dcache_residency) {
+        return;
+    }
+
+    /* Single-pass scan for relocatable signature plugins (e.g. Sony MultiStream
+     * 12 KB packed DSP banks) to avoid scanning every audio/geometry DMA N times. */
+    int reloc_idx[16];
+    uint64_t reloc_s0[16], reloc_s1[16];
+    uint32_t reloc_hit_off[16];
+    int reloc_matched[16];
+    int n_reloc = 0;
+    if (size >= 512) {
+        for (int i = 0; i < nsrc && n_reloc < 16; i++) {
+            const spu_ovl_src* o = &s_ovl_src[i];
+            if (o->has_sig && o->span && o->canon) {
+                reloc_idx[n_reloc] = i;
+                memcpy(&reloc_s0[n_reloc], o->sig, 8);
+                memcpy(&reloc_s1[n_reloc], o->sig + 8, 8);
+                reloc_matched[n_reloc] = 0;
+                n_reloc++;
+            }
+        }
+        if (n_reloc > 0) {
+            const uint32_t step = 0x10u;
+            int found_cnt = 0;
+            for (uint32_t off = 0; off + 16u <= size; off += step) {
+                uint64_t w0;
+                memcpy(&w0, ls + off, 8);
+                for (int r = 0; r < n_reloc; r++) {
+                    if (!reloc_matched[r] && w0 == reloc_s0[r]) {
+                        uint64_t w1;
+                        memcpy(&w1, ls + off + 8, 8);
+                        if (w1 == reloc_s1[r]) {
+                            reloc_matched[r] = 1;
+                            reloc_hit_off[r] = off;
+                            found_cnt++;
+                            break;
+                        }
+                    }
+                }
+                if (found_cnt == n_reloc) break;
+            }
+            if (found_cnt > 0) {
+                for (int r = 0; r < n_reloc; r++) {
+                    if (!reloc_matched[r]) continue;
+                    const int i = reloc_idx[r];
+                    const spu_ovl_src* o = &s_ovl_src[i];
+                    const uint32_t match_off = reloc_hit_off[r];
+                    const uint32_t hit_lsa = lsa + match_off;
+                    if (hit_lsa + o->span > SPU_LS_SIZE) continue;
+                    int bound = 0;
+                    for (unsigned slot = 0; slot < 4; ++slot) {
+                        if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != hit_lsa &&
+                            ctx->resident_code[slot].image_id != o->image_id)
+                            continue;
+                        const int changed =
+                            (ctx->resident_code[slot].lsa != hit_lsa) ||
+                            (ctx->resident_code[slot].size != o->span) ||
+                            (ctx->resident_code[slot].image_id != o->image_id) ||
+                            (ctx->resident_code[slot].canon != o->canon);
+                        ctx->resident_code[slot].lsa = hit_lsa;
+                        ctx->resident_code[slot].size = o->span;
+                        ctx->resident_code[slot].source_ea = ea + match_off;
+                        ctx->resident_code[slot].image_id = o->image_id;
+                        ctx->resident_code[slot].verify_state = 0;
+                        ctx->resident_code[slot].source_index = i;
+                        ctx->resident_code[slot].canon = o->canon;
+                        if (changed) {
+                            spu_dcache_residency_changed(ctx);
+                            static int _rl = 0;
+                            if (PS3_LOG_FIRST(_rl, 16))
+                                fprintf(stderr, "[spu-ovl] img=%d reloc sig -> LS 0x%05X span=0x%X canon=0x%X image %d (off=+0x%X)\n",
+                                        ctx->image_id, hit_lsa, o->span, o->canon, o->image_id, match_off);
+                        }
+                        bound = 1;
+                        break;
+                    }
+                    if (!bound)
+                        fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
+                }
+                t_reloc_memo.ea = ea;
+                t_reloc_memo.lsa = lsa;
+                t_reloc_memo.size = size;
+                t_reloc_memo.nsrc = nsrc;
+                t_reloc_memo.img = ctx->image_id;
+                t_reloc_memo.residency = ctx->dcache_residency;
+                return;
+            }
+        }
+    }
+
     for (int i = 0; i < nsrc; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
-        int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
-                             : (o->src_ea == ea);
+        int hit = 0;
+        if (o->has_sig) {
+            if (o->span && o->canon) continue; /* handled in single-pass loop above */
+            hit = (size >= 512 && memcmp(ls, o->sig, 16) == 0);
+        } else {
+            hit = (o->src_ea == ea);
+        }
         if (hit) {
             if (o->span) {
                 if (lsa + o->span > SPU_LS_SIZE) return;
                 /* Verified code was lifted for one load address. */
-                if (o->code && lsa != o->load_lsa) continue;
+                if (o->code && lsa != o->load_lsa) return;
                 for (unsigned slot = 0; slot < 4; ++slot) {
                     /* A relocatable image takes over its own previous placement's slot: each load
                      * lands somewhere new, and stale copies would fill the slots. */

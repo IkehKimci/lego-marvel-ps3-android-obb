@@ -63,7 +63,8 @@ extern u32 ppu_vm_size;
 #define ENG_MAX_VTEXTURES  64
 #define ENG_MAX_PIPELINES  8192
 #define ENG_PIPELINE_INDEX 16384u        /* open-addressed key index, 2x the table */
-#define ENG_VP_MEMO        64
+#define ENG_VP_MEMO_SETS   64u
+#define ENG_VP_MEMO        (ENG_VP_MEMO_SETS * 2u)
 #define ENG_MAX_BATCHES    256
 #define ENG_VERT_STRIDE    (RSX_DSP_NUM_VERTEX_ATTR * 16u)
 #define ENG_INVALID        0xFFFFFFFFu
@@ -149,6 +150,7 @@ typedef struct {
     u32 snapshot;          /* sampleable copy, or 0                        */
     u32 snap_w, snap_h;    /* the region that copy holds                    */
     u64 snap_serial;       /* depth_serial the snapshot holds               */
+    u64 snap_pass;         /* g.pass_serial snapshot may be shared in, or 0 */
     int cleared;
     int had_write;
     int snapshot_valid;
@@ -159,6 +161,7 @@ typedef struct {
     u32 conv;              /* depth_as_color of the depth at conv_serial, or 0 */
     u32 conv_w, conv_h, conv_fmt;
     u64 conv_serial;
+    u64 conv_pass;         /* g.pass_serial conv may be shared in, or 0     */
     u32 last_use;          /* g.frames when last bound or sampled             */
     u32 ext_w, ext_h;      /* the largest clip it was bound with: past it,
                             * nothing was drawn or cleared (eng_clear_rect) */
@@ -200,7 +203,7 @@ typedef struct { u32 first, count; } eng_batch;
 typedef struct {
     const u8* uc;
     u32 bytes;
-    u64 seed, hash;
+    u64 seed, hash, fp;
     u32 input_mask;
     u8  input_exact;
     u8  uses_branch_bits;
@@ -211,7 +214,8 @@ typedef struct {
  * constant slots), structural hash (with FNV offset basis), texture masks,
  * and byte offsets of every inline constant slot so repeat draws verify the
  * instruction words in 64-bit chunks and read only the inline constants. */
-#define ENG_FP_MEMO        64u
+#define ENG_FP_MEMO_SETS   256u
+#define ENG_FP_MEMO        (ENG_FP_MEMO_SETS * 2u)
 #define ENG_FP_MEMO_INSTS  256u
 #define ENG_FP_MEMO_CONSTS 128u
 typedef struct {
@@ -306,9 +310,9 @@ static struct {
     u32 n_pipelines;
     u16 pipeline_index[ENG_PIPELINE_INDEX];   /* pipelines[] slot + 1, 0 = empty */
     eng_vp_memo vp_memo[ENG_VP_MEMO];
-    u32 vp_memo_next;
+    u8 vp_memo_lru[ENG_VP_MEMO_SETS];
     eng_fp_memo fp_memo[ENG_FP_MEMO];
-    u32 fp_memo_next;
+    u8 fp_memo_lru[ENG_FP_MEMO_SETS];
     eng_display_buffer display_buffers[8];
 
     u32 frames;
@@ -528,26 +532,37 @@ static struct {
 static const eng_vp_memo* eng_vp_memo_get(const u8* uc, u32 bytes, u64 seed)
 {
     if (!uc || !bytes || bytes > sizeof g.vp_memo[0].copy) return NULL;
-    static u32 s_last_idx = 0;
-    {
-        eng_vp_memo* m = &g.vp_memo[s_last_idx];
-        if (m->uc == uc && m->bytes == bytes && m->seed == seed &&
-            !memcmp(m->copy, uc, bytes))
-            return m;
+    u64 h0 = 0, h1 = 0, t0 = 0, t1 = 0;
+    if (bytes >= 16u) {
+        memcpy(&h0, uc, 8);
+        memcpy(&h1, uc + 8, 8);
+        memcpy(&t0, uc + bytes - 16u, 8);
+        memcpy(&t1, uc + bytes - 8u, 8);
+    } else {
+        memcpy(&h0, uc, bytes < 8u ? bytes : 8u);
     }
-    for (u32 i = 0; i < ENG_VP_MEMO; i++) {
-        eng_vp_memo* m = &g.vp_memo[i];
-        if (m->uc == uc && m->bytes == bytes && m->seed == seed &&
+    const u64 fp = ((h0 ^ (h1 * 0x9E3779B97F4A7C15ull)) ^
+                    (t0 * 0xBF58476D1CE4E5B9ull) ^ t1 ^
+                    ((u64)bytes << 32) ^ (u64)(uintptr_t)uc);
+    const u32 set = (u32)((fp ^ (fp >> 32)) & (ENG_VP_MEMO_SETS - 1u));
+    const u32 base = set * 2u;
+    for (u32 w = 0; w < 2u; w++) {
+        eng_vp_memo* m = &g.vp_memo[base + w];
+        if (m->bytes == bytes && m->uc == uc && m->seed == seed && m->fp == fp &&
             !memcmp(m->copy, uc, bytes)) {
-            s_last_idx = i;
+            g.vp_memo_lru[set] = (u8)(w ^ 1u);
             return m;
         }
     }
-    const u32 idx = g.vp_memo_next++ % ENG_VP_MEMO;
-    eng_vp_memo* m = &g.vp_memo[idx];
+    u32 victim = g.vp_memo_lru[set] & 1u;
+    if (!g.vp_memo[base].bytes) victim = 0u;
+    else if (!g.vp_memo[base + 1u].bytes) victim = 1u;
+    g.vp_memo_lru[set] = (u8)(victim ^ 1u);
+    eng_vp_memo* m = &g.vp_memo[base + victim];
     m->uc = uc;
     m->bytes = bytes;
     m->seed = seed;
+    m->fp = fp;
     memcpy(m->copy, uc, bytes);
     m->hash = eng_fnv1a(uc, bytes, seed);
     rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
@@ -561,7 +576,6 @@ static const eng_vp_memo* eng_vp_memo_get(const u8* uc, u32 bytes, u64 seed)
         m->input_exact = 0;
     }
     m->uses_branch_bits = (u8)(rsx_vp_uses_branch_bits(uc, bytes) != 0);
-    s_last_idx = idx;
     return m;
 }
 
@@ -1445,6 +1459,8 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->handle = handle;
     z->snapshot = 0;
     z->snap_serial = 0;
+    z->snap_pass = 0;
+    z->conv_pass = 0;
     z->cleared = 0;
     z->had_write = 0;
     z->snapshot_valid = 0;
@@ -1458,11 +1474,13 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     return slot;
 }
 
+static int eng_feedback_per_pass(void);
+
 /* A depth target read back as a texture, but only once the pass has executed
  * a depth-WRITING draw: a write-enable bit alone does not prove the pass
  * produced a usable depth map, and a clear-only zeta falls through to guest
  * memory instead (rsx_live_draw.c:6016-6018, 6265-6269). */
-static u32 eng_zdepth_snapshot(u32 slot, u32 tex_w, u32 tex_h)
+static u32 eng_zdepth_snapshot(u32 slot, u32 tex_w, u32 tex_h, int own_pass)
 {
     eng_zdepth* z = &g.zdepths[slot];
     if (!z->handle || !z->had_write) return 0;
@@ -1476,7 +1494,8 @@ static u32 eng_zdepth_snapshot(u32 slot, u32 tex_w, u32 tex_h)
     const u32 w = (tex_w && tex_w < z->w) ? tex_w : z->w;
     const u32 h = (tex_h && tex_h < z->h) ? tex_h : z->h;
     if (z->snapshot_valid && z->snapshot && z->snap_w == w && z->snap_h == h &&
-        z->snap_serial == z->depth_serial)
+        (z->snap_serial == z->depth_serial ||
+         (own_pass && eng_feedback_per_pass() && z->snap_pass && z->snap_pass == g.pass_serial)))
         return z->snapshot;
     if (!g.be->depth_snapshot) return 0;
     const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, w, h);
@@ -1493,6 +1512,7 @@ static u32 eng_zdepth_snapshot(u32 slot, u32 tex_w, u32 tex_h)
     z->snap_w = w;
     z->snap_h = h;
     z->snap_serial = z->depth_serial;
+    z->snap_pass = own_pass ? g.pass_serial : 0;
     z->snapshot_valid = 1;
     return tex;
 }
@@ -1518,7 +1538,7 @@ static int s_depth_via_guest;
  * shadow map, takes the same way: without it every read of a freshly
  * rendered shadow map is a wait for the GPU plus a decode and an upload of
  * up to 2 MB. Returns the view, or 0 for the store through guest memory. */
-static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
+static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t, int own_pass)
 {
     eng_zdepth* z = &g.zdepths[slot];
     const u32 base_fmt = t->format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
@@ -1534,8 +1554,10 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
     if (!t->width || !t->height || t->width > used_w || t->height > used_h ||
         t->pitch != z->pitch)
         return 0;
-    if (!z->conv || z->conv_serial != z->depth_serial || z->conv_fmt != base_fmt ||
-        z->conv_w != t->width || z->conv_h != t->height) {
+    const int conv_shared = own_pass && eng_feedback_per_pass() &&
+                            z->conv_pass && z->conv_pass == g.pass_serial;
+    if (!z->conv || (z->conv_serial != z->depth_serial && !conv_shared) ||
+        z->conv_fmt != base_fmt || z->conv_w != t->width || z->conv_h != t->height) {
         const u32 tex = g.be->depth_as_color(g.be->user, z->handle, t->width, t->height,
                                              base_fmt);
         if (!tex) return 0;
@@ -1543,6 +1565,7 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
         z->conv = tex;
         z->conv_w = t->width; z->conv_h = t->height; z->conv_fmt = base_fmt;
         z->conv_serial = z->depth_serial;
+        z->conv_pass = own_pass ? g.pass_serial : 0;
     }
     return g.be->surface_view(g.be->user, z->conv, t->remap & 0xFFFFu, t->format);
 }
@@ -2362,19 +2385,14 @@ static int eng_fp_memo_scan(const u8* fp_uc, int allow_cache,
                             rsx_fp_constant_block* out_consts)
 {
     static const u64 kFnvSeed = 1469598103934665603ull;
-    static u32 s_last_fp = 0;
+    const u32 set = (u32)((((uintptr_t)fp_uc >> 4) * 0x9E3779B1u) & (ENG_FP_MEMO_SETS - 1u));
+    const u32 base = set * 2u;
     if (allow_cache) {
-        {
-            const eng_fp_memo* m = &g.fp_memo[s_last_fp];
-            if (m->uc == fp_uc && m->n_insts &&
-                eng_fp_memo_match_and_read(m, fp_uc, out_info, out_consts))
-                return 1;
-        }
-        for (u32 i = 0; i < ENG_FP_MEMO; i++) {
-            const eng_fp_memo* m = &g.fp_memo[i];
+        for (u32 w = 0; w < 2u; w++) {
+            const eng_fp_memo* m = &g.fp_memo[base + w];
             if (m->uc == fp_uc && m->n_insts &&
                 eng_fp_memo_match_and_read(m, fp_uc, out_info, out_consts)) {
-                s_last_fp = i;
+                g.fp_memo_lru[set] = (u8)(w ^ 1u);
                 return 1;
             }
         }
@@ -2384,8 +2402,11 @@ static int eng_fp_memo_scan(const u8* fp_uc, int allow_cache,
     if (allow_cache && out_info->size > 0 && out_info->size <= 65535u &&
         out_consts->count <= ENG_FP_MEMO_CONSTS) {
         /* Record instruction offsets/words and constant offsets for O(insts) 64-bit checks. */
-        const u32 idx = g.fp_memo_next++ % ENG_FP_MEMO;
-        eng_fp_memo* m = &g.fp_memo[idx];
+        u32 victim = g.fp_memo_lru[set] & 1u;
+        if (g.fp_memo[base].uc == fp_uc || !g.fp_memo[base].n_insts) victim = 0u;
+        else if (g.fp_memo[base + 1u].uc == fp_uc || !g.fp_memo[base + 1u].n_insts) victim = 1u;
+        g.fp_memo_lru[set] = (u8)(victim ^ 1u);
+        eng_fp_memo* m = &g.fp_memo[base + victim];
         u32 off = 0, ni = 0, nc = 0;
         int ok = 1;
         while (off + 16u <= out_info->size) {
@@ -2412,7 +2433,6 @@ static int eng_fp_memo_scan(const u8* fp_uc, int allow_cache,
             m->n_insts = ni;
             m->n_consts = nc;
             m->info = *out_info;
-            s_last_fp = idx;
         } else {
             m->uc = NULL;
             m->n_insts = 0;
@@ -2904,8 +2924,6 @@ static u32 eng_pipeline_get(const eng_prog_ctx* prog,
             unnorm_dim[u][1] = g.cached_unnorm_dim[u][1];
             unnorm_dim[u][2] = g.cached_unnorm_dim[u][2];
         }
-    } else {
-        memset(unnorm_dim, 0, sizeof unnorm_dim);
     }
 
     /* An antialiased target is held at its sample grid; WPOS must still count
@@ -3016,9 +3034,10 @@ static u32 eng_pipeline_get(const eng_prog_ctx* prog,
         if (fi > 0 && wpos_scaled &&
             rsx_fp_apply_wpos_grid(s_ps_hlsl, sizeof s_ps_hlsl, wpos_grid[0], wpos_grid[1]) < 0)
             fi = -1;
-        if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
-                                                (const u32 (*)[3])unnorm_dim, cube_mask,
-                                                vol_mask) < 0)
+        if (fi > 0 && unnorm_mask &&
+            rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
+                                      (const u32 (*)[3])unnorm_dim, cube_mask,
+                                      vol_mask) < 0)
             fi = -1;
         if (fi > 0 && srgb_output &&
             rsx_fp_apply_srgb_output(s_ps_hlsl, sizeof s_ps_hlsl) < 0)
@@ -3969,12 +3988,13 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             /* DEPTH24_D8 keeps the backend's own separate R32_SFLOAT snapshot
              * taken in command order (safe even when the zeta is still bound,
              * since z->snapshot is an independent image refreshed whenever
-             * depth_serial advances). */
+             * depth_serial advances or shared per-pass under FEEDBACK_PER_PASS). */
+            const int own_z = ((u32)zsrc == current_zslot);
             if (base_fmt == RSX_TEX_FMT_DEPTH24_D8) {
-                const u32 snap = eng_zdepth_snapshot((u32)zsrc, t.width, t.height);
+                const u32 snap = eng_zdepth_snapshot((u32)zsrc, t.width, t.height, own_z);
                 if (snap) { textures[u] = snap; continue; }
             }
-            const u32 conv = eng_zdepth_as_color((u32)zsrc, &t);
+            const u32 conv = eng_zdepth_as_color((u32)zsrc, &t, own_z);
             if (conv) { textures[u] = conv; continue; }
             if (eng_zdepth_to_guest((u32)zsrc)) {
                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,
@@ -4035,7 +4055,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 if (g.zdepths[i].location == t.location &&
                     g.zdepths[i].offset == t.offset && current_zslot != i) {
                     g.zdepths[i].last_use = g.frames;
-                    const u32 snap = eng_zdepth_snapshot(i, t.width, t.height);
+                    const u32 snap = eng_zdepth_snapshot(i, t.width, t.height, 0);
                     if (snap) textures[u] = snap;
                     break;
                 }
@@ -4612,8 +4632,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
         draw_n_verts = dc.n_verts;
         draw_indices = indexed ? g.indices : NULL;
         if (vc_elig) {
-            vc_id = eng_vcache_store(&vc_key, vc_hash, &layout, dc.verts, dc.n_verts,
-                                     indexed ? g.indices : NULL, n_draw, indexed);
+            /* Store in CPU vcache on first sight, but do NOT promote to the
+             * persistent GPU vertex cache until a subsequent frame proves the
+             * geometry is actually static (vc_hit_ok == 1). Otherwise dynamic
+             * 1-frame rain/particle bursts overflow the 64 MB GPU arena and
+             * trigger full GPU-drain sync flushes every few frames! */
+            (void)eng_vcache_store(&vc_key, vc_hash, &layout, dc.verts, dc.n_verts,
+                                   indexed ? g.indices : NULL, n_draw, indexed);
         }
     }
     const u64 t_vtx1 = eng_now_ns();
@@ -4741,9 +4766,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
         g.fp_cb = n;
         g.fp_cb_cap = fp_bytes;
     }
-    memset(g.fp_cb, 0, fp_bytes);
     if (g.fp_constants.count)
         memcpy(g.fp_cb, g.fp_constants.values, g.fp_constants.count * 16u);
+    else
+        memset(g.fp_cb, 0, 16u);
     { float* alpha = (float*)(g.fp_cb + nslots * 16u);
       alpha[0] = rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format);
       /* Window convention for WPOS (rsx_fp_decompiler.c, _rsx_wpos): SET_SHADER_WINDOW
@@ -4953,6 +4979,8 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
              * Past a partial clear the rest still holds what was drawn. */
             if (!partial) g.zdepths[zslot].had_write = 0;
             g.zdepths[zslot].snapshot_valid = 0;
+            g.zdepths[zslot].snap_pass = 0;
+            g.zdepths[zslot].conv_pass = 0;
             eng_zdepth_wrote(zslot, &sf);
         }
     }

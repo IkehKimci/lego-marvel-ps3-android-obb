@@ -576,6 +576,16 @@ enum {
     VK_SYNC_SNAP = 4,
     VK_SYNC_TAG_COUNT = 5
 };
+enum {
+    VK_PB_FB    = 0,
+    VK_PB_CLR   = 1,
+    VK_PB_SELF  = 2,
+    VK_PB_CSNAP = 3,
+    VK_PB_DSNAP = 4,
+    VK_PB_UPL   = 5,
+    VK_PB_BLIT  = 6,
+    VK_PB_COUNT = 7,
+};
 static u32 s_eb_pending;
 static void vk_eng_flush(void);
 static void vk_eng_flush_sync(void);
@@ -585,6 +595,7 @@ static int  vk_eb_defer_image(vk_image* im);
 static int  vk_eb_defer_fb(VkFramebuffer* fb);
 static void vk_eb_perf_present(void);
 static void vk_eb_end_pass(void);
+static void vk_eb_end_pass_reason(int reason);
 static int vk_eb_on(void);
 static int vk_eb_active(void);       /* batching decided on and on */
 static u32 vk_eb_max(void);
@@ -951,6 +962,22 @@ static int vk_begin(void)
     return 0;
 }
 
+static VkResult vk_wait_fence_logged(VkFence fence, const char* where)
+{
+    for (u32 n = 1u; ; n++) {
+        VkResult r = pvkWaitForFences(s_vk.device, 1, &fence, VK_TRUE, 2000000000ull /* 2s */);
+        if (r == VK_SUCCESS) return VK_SUCCESS;
+        if (r == VK_TIMEOUT) {
+            if (n <= 5u || (n % 5u) == 0u)
+                VK_LOG("WARNING: vkWaitForFences(%s) stalled >%us\n", where, n * 2u);
+            if (n >= 5u) return VK_TIMEOUT;
+            continue;
+        }
+        VK_LOG("ERROR: vkWaitForFences(%s) failed (VkResult %d)\n", where, (int)r);
+        return r;
+    }
+}
+
 static int vk_submit_and_wait(void)
 {
     VK_CHECK(pvkEndCommandBuffer(s_vk.cmd), "vkEndCommandBuffer");
@@ -958,7 +985,7 @@ static int vk_submit_and_wait(void)
                         .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
     VK_CHECK(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences");
     VK_CHECK(vk_queue_submit(&si, s_vk.fence), "vkQueueSubmit");
-    VK_CHECK(pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    VK_CHECK(vk_wait_fence_logged(s_vk.fence, "submit_and_wait"), "vkWaitForFences");
     return 0;
 }
 
@@ -3143,9 +3170,12 @@ static void vk_present_window(void)
     if (!s_vk.swapchain || vk_window_hidden()) return;
 
     u32 idx = 0;
-    VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
+    VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, 500000000ull /* 500 ms */,
                                         s_vk.sem_acquire, VK_NULL_HANDLE, &idx);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); return; }
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_TIMEOUT) {
+        if (r == VK_TIMEOUT) VK_LOG("WARNING: vkAcquireNextImageKHR (window) timed out -> recreating swapchain\n");
+        vk_swapchain_lost(); return;
+    }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
         VK_LOG("vkAcquireNextImageKHR failed (VkResult %d)\n", (int)r); return;
     }
@@ -3172,7 +3202,7 @@ static void vk_present_window(void)
     if (vk_queue_submit(&si, s_vk.window_fence) != VK_SUCCESS) {
         VK_LOG("vkQueueSubmit (window) failed\n"); return;
     }
-    pvkWaitForFences(s_vk.device, 1, &s_vk.window_fence, VK_TRUE, UINT64_MAX);
+    vk_wait_fence_logged(s_vk.window_fence, "present_window");
 
     VkPresentInfoKHR pi = {
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -3267,7 +3297,7 @@ static void vk_present_wait_gpu(void)
 {
     for (u32 i = 0; i < VK_PRESENT_SLOTS; i++)
         if (__atomic_load_n(&s_vk.present_busy[i], __ATOMIC_ACQUIRE) && s_vk.present_fences[i])
-            pvkWaitForFences(s_vk.device, 1, &s_vk.present_fences[i], VK_TRUE, UINT64_MAX);
+            vk_wait_fence_logged(s_vk.present_fences[i], "present_wait_gpu");
     vk_pt_wait_stages();   /* a present thread's copies out of a surface */
     vk_coop_wait_gpu();    /* async Co-op P2 copy out of a surface */
 }
@@ -3277,7 +3307,7 @@ static void vk_present_wait_gpu(void)
 static void vk_present_complete_locked(void)
 {
     if (!s_vk.present_inflight) return;
-    pvkWaitForFences(s_vk.device, 1, &s_vk.present_fence, VK_TRUE, UINT64_MAX);
+    vk_wait_fence_logged(s_vk.present_fence, "present_complete");
     __atomic_store_n(&s_vk.present_busy[s_vk.present_slot], 0, __ATOMIC_RELEASE);
     __atomic_store_n(&s_vk.present_inflight, 0, __ATOMIC_RELEASE);
 
@@ -3301,7 +3331,7 @@ static VkCommandBuffer vk_present_record_begin(void)
     vk_present_complete_locked();
     const u32 slot = (s_vk.present_slot + 1u) % VK_PRESENT_SLOTS;
     if (s_vk.present_busy[slot]) {
-        pvkWaitForFences(s_vk.device, 1, &s_vk.present_fences[slot], VK_TRUE, UINT64_MAX);
+        vk_wait_fence_logged(s_vk.present_fences[slot], "present_record_begin");
         __atomic_store_n(&s_vk.present_busy[slot], 0, __ATOMIC_RELEASE);
     }
     s_vk.present_slot = slot;
@@ -3335,11 +3365,13 @@ static void vk_present_direct_end(VkCommandBuffer cb)
                 s_vk.present_acquire[slot] = VK_NULL_HANDLE;
         }
         acquire = s_vk.present_acquire[slot];
-        VkResult r = acquire ? pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
+        VkResult r = acquire ? pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, 500000000ull /* 500 ms */,
                                                       acquire, VK_NULL_HANDLE, &idx)
                              : VK_ERROR_INITIALIZATION_FAILED;
-        if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); window = 0; }
-        else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_TIMEOUT) {
+            if (r == VK_TIMEOUT) VK_LOG("WARNING: vkAcquireNextImageKHR (direct) timed out -> recreating swapchain\n");
+            vk_swapchain_lost(); window = 0;
+        } else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
             VK_LOG("vkAcquireNextImageKHR failed (VkResult %d)\n", (int)r); window = 0;
         }
         if (window) vk_record_window_blit(cb, idx);
@@ -3926,6 +3958,9 @@ static void vk_eng_flush_pending_clear(vk_eng_obj* o)
     }
 }
 
+static int vk_eb_uses_color(u32 surface);
+static int vk_eb_uses_depth(u32 depth);
+
 static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
 {
     (void)user;
@@ -3938,8 +3973,9 @@ static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
     if (!o) return;
     if (vk_eb_active()) {
         /* Defer into the next render pass's LOAD_OP_CLEAR to avoid an
-         * off-tile Sysmem clear + Sysmem unresolve reload on Adreno TBDR. */
-        vk_eb_end_pass();
+         * off-tile Sysmem clear + Sysmem unresolve reload on Adreno TBDR.
+         * Only end an already-open pass if it actually references this target. */
+        if (vk_eb_uses_color(surface)) vk_eb_end_pass_reason(VK_PB_CLR);
         o->pending_clear_color = 1;
         memcpy(o->pending_rgba, rgba, sizeof o->pending_rgba);
         return;
@@ -3964,7 +4000,7 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
     if (flags & RSX_BE_CLEAR_STENCIL) aspect |= s_vk.depth_aspect & VK_IMAGE_ASPECT_STENCIL_BIT;
     if (!o || !aspect) return;
     if (vk_eb_active()) {
-        vk_eb_end_pass();
+        if (vk_eb_uses_depth(depth)) vk_eb_end_pass_reason(VK_PB_CLR);
         if (flags & RSX_BE_CLEAR_DEPTH) {
             o->pending_clear_depth |= 1u;
             o->pending_depth_val = depth_value;
@@ -5722,7 +5758,7 @@ static int vk_eng_surface_blit(void* user, u32 src, u32 sx, u32 sy, u32 sw, u32 
     const int same_size = (sw == dw && sh == dh && so->fmt == do_->fmt && !linear);
     const int batch = vk_eb_active();
     if (batch ? (!s_eb_pending && vk_begin()) : vk_begin()) return -1;
-    if (batch) vk_eb_end_pass();
+    if (batch) vk_eb_end_pass_reason(VK_PB_BLIT);
     vk_cmd_pass_barrier(s_vk.cmd);
     if (same_size) {
         VkImageCopy ic = {
@@ -5997,7 +6033,7 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
     const int batch = vk_eb_active();
     if (batch ? (!s_eb_pending && vk_begin()) : vk_begin()) { vk_eng_release(user, hd); return 0; }
     if (batch) {
-        vk_eb_end_pass();
+        vk_eb_end_pass_reason(VK_PB_CSNAP);
         vk_cmd_pass_barrier(s_vk.cmd);
     }
     if (!reused)
@@ -6086,7 +6122,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
     const int batch = vk_eb_active();
     int rc = (batch && s_eb_pending) ? 0 : vk_begin();
     if (!rc && batch) {
-        vk_eb_end_pass();
+        vk_eb_end_pass_reason(VK_PB_DSNAP);
         vk_cmd_pass_barrier(s_vk.cmd);
     }
     if (!rc) {
@@ -6395,7 +6431,7 @@ static u32 vk_eng_depth_as_color(void* user, u32 depth, u32 w, u32 h, u32 rsx_fm
 
     if (batch ? (!s_eb_pending && vk_begin()) : vk_begin()) { vk_eng_release(user, hd); return 0; }
     if (batch) {
-        vk_eb_end_pass();
+        vk_eb_end_pass_reason(VK_PB_DSNAP);
         vk_cmd_pass_barrier(s_vk.cmd);
     }
     if (!reused)
@@ -7514,9 +7550,13 @@ static void vk_eng_bind_textures(void* user, const u32* textures,
                                  const rsx_be_sampler_desc* samplers, u32 mask)
 {
     (void)user;
+    mask &= (1u << RSX_BE_MAX_TEXTURES) - 1u;
     int changed = (s_e2.tex_mask != mask);
-    for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
-        const int on = (mask >> u) & 1u;
+    u32 work = mask | s_e2.tex_mask;
+    while (work) {
+        const u32 u = (u32)__builtin_ctz(work);
+        work &= work - 1u;
+        const int on = (int)((mask >> u) & 1u);
         const u32 h = on ? textures[u] : 0u;
         if (s_e2.tex[u] != h) {
             s_e2.tex[u] = h;
@@ -7534,9 +7574,13 @@ static void vk_eng_bind_vertex_textures(void* user, const u32* textures,
                                         const rsx_be_sampler_desc* samplers, u32 mask)
 {
     (void)user;
+    mask &= (1u << RSX_BE_MAX_VERTEX_TEXTURES) - 1u;
     int changed = (s_e2.vtex_mask != mask);
-    for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
-        const int on = (mask >> u) & 1u;
+    u32 work = mask | s_e2.vtex_mask;
+    while (work) {
+        const u32 u = (u32)__builtin_ctz(work);
+        work &= work - 1u;
+        const int on = (int)((mask >> u) & 1u);
         const u32 h = on ? textures[u] : 0u;
         if (s_e2.vtex[u] != h) {
             s_e2.vtex[u] = h;
@@ -7786,6 +7830,7 @@ typedef struct {
     VkDescriptorPool pool;
     u32              sets;
     int              has_last_vs, has_last_ps;
+    int              last_vs_copy_valid;
     u32              last_vs_gen, last_ps_gen;
     u16              last_vs_lo, last_vs_hi;
     VkDeviceSize     last_vs_off, last_ps_off;
@@ -7839,6 +7884,7 @@ static struct {
     u32              p_frames, p_draws, p_passes, p_flushes;
     u32              p_reason[VK_FLUSH_REASON_COUNT];
     u32              p_sync_tag[VK_SYNC_TAG_COUNT];
+    u32              p_pb[VK_PB_COUNT];
     u32              p_vs_dedup, p_ps_dedup, p_ds_hit;
     u32              p_gpuvc_hit, p_clear_fold;
     u32              p_fg_last, p_acomp_last, p_async_skip;
@@ -7976,13 +8022,14 @@ static void vk_eb_wait_slot(u32 idx)
     vk_eb_slot* sl = &s_eb.slot[idx];
     if (sl->busy) {
         const double t0 = vk_now_seconds();
-        pvkWaitForFences(s_vk.device, 1, &sl->fence, VK_TRUE, UINT64_MAX);
+        vk_wait_fence_logged(sl->fence, "eb_wait_slot");
         s_eb.p_wait_sec += vk_now_seconds() - t0;
         sl->busy = 0;
     }
     vk_eb_drain_defer(sl);
     sl->vb_head = sl->ib_head = sl->ub_head = sl->sb_head = 0;
     sl->has_last_vs = sl->has_last_ps = 0;
+    sl->last_vs_copy_valid = 0;
     sl->last_ds_set = VK_NULL_HANDLE;
     if (sl->sets) {
         pvkResetDescriptorPool(s_vk.device, sl->pool, 0);
@@ -8126,6 +8173,34 @@ static void vk_eb_end_pass(void)
     s_eb.dyn_valid = 0;
 }
 
+static void vk_eb_end_pass_reason(int reason)
+{
+    if (!s_eb.in_pass) return;
+    if (reason >= 0 && reason < VK_PB_COUNT)
+        s_eb.p_pb[reason]++;
+    vk_eb_end_pass();
+}
+
+static int vk_eb_uses_color(u32 surface)
+{
+    if (!s_eb.in_pass || !surface || surface >= VK_ENG_MAX_OBJ) return 0;
+    const VkImage img = s_eobj[surface].im.img;
+    for (u32 i = 0; i < s_eb.open_nrt; i++) {
+        const u32 rh = s_eb.open_rt[i];
+        if (rh == surface || (img && rh && rh < VK_ENG_MAX_OBJ && s_eobj[rh].im.img == img))
+            return 1;
+    }
+    return 0;
+}
+
+static int vk_eb_uses_depth(u32 depth)
+{
+    if (!s_eb.in_pass || !depth || depth >= VK_ENG_MAX_OBJ || !s_eb.open_depth) return 0;
+    if (s_eb.open_depth == depth) return 1;
+    const VkImage img = s_eobj[depth].im.img;
+    return img && s_eb.open_depth < VK_ENG_MAX_OBJ && s_eobj[s_eb.open_depth].im.img == img;
+}
+
 static int vk_eb_draw_samples_open_rt(void)
 {
     if (!s_eb.in_pass || (!s_eb.open_rt_dirty && !s_eb.open_depth_dirty) ||
@@ -8255,7 +8330,7 @@ static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src,
             memcpy((u8*)sl->sb.ptr + off + (size_t)y * tight, (const u8*)src + (size_t)y * row_bytes, tight);
     }
     if (!s_eb_pending && vk_begin()) return -1;
-    vk_eb_end_pass();
+    vk_eb_end_pass_reason(VK_PB_UPL);
     vk_cmd_pass_barrier(s_vk.cmd);
     region->bufferOffset = off;
     pvkCmdCopyBufferToImage(s_vk.cmd, sl->sb.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, region);
@@ -8325,10 +8400,13 @@ static void vk_eb_perf_present(void)
     const u32 acomp_now = vk_apipe_completed();
     const u32 acomp_delta = acomp_now - s_eb.p_acomp_last;
     s_eb.p_acomp_last = acomp_now;
-    VK_LOG("[vk-perf] %uf avg: draws=%.0f/f passes=%.1f/f flushes=%.2f/f "
+    VK_LOG("[vk-perf] %uf avg: draws=%.0f/f passes=%.1f/f pb(%u/%u/%u/%u/%u/%u/%u) flushes=%.2f/f "
            "(max=%u ring=%u early=%u pres=%u sync=%u[%u/%u/%u/%u/%u]) wait=%.1fms/f "
            "dedup(vs=%u%% ps=%u%% ds=%u%% gpuvc=%u%%) clrf=%.1f/f dac=%u fg=%u acomp=%u askip=%u\n",
-           s_eb.p_frames, s_eb.p_draws * inv, s_eb.p_passes * inv, s_eb.p_flushes * inv,
+           s_eb.p_frames, s_eb.p_draws * inv, s_eb.p_passes * inv,
+           s_eb.p_pb[VK_PB_FB], s_eb.p_pb[VK_PB_CLR], s_eb.p_pb[VK_PB_SELF],
+           s_eb.p_pb[VK_PB_CSNAP], s_eb.p_pb[VK_PB_DSNAP], s_eb.p_pb[VK_PB_UPL],
+           s_eb.p_pb[VK_PB_BLIT], s_eb.p_flushes * inv,
            s_eb.p_reason[VK_FLUSH_MAX], s_eb.p_reason[VK_FLUSH_RING],
            s_eb.p_reason[VK_FLUSH_EARLY], s_eb.p_reason[VK_FLUSH_PRESENT],
            s_eb.p_reason[VK_FLUSH_SYNC],
@@ -8344,6 +8422,7 @@ static void vk_eb_perf_present(void)
     s_dac.calls = 0;
     memset(s_eb.p_reason, 0, sizeof s_eb.p_reason);
     memset(s_eb.p_sync_tag, 0, sizeof s_eb.p_sync_tag);
+    memset(s_eb.p_pb, 0, sizeof s_eb.p_pb);
 }
 
 static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSize bytes, VkDeviceSize align)
@@ -8606,12 +8685,13 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
      * allocating slices in the active slot) so Adreno executes pass 1 while
      * CPU records pass 2 with zero extra TBDR pass splits. */
     if (batched && s_eb_pending >= 1024u) {
-        const int would_same_pass = !clear_mask && s_eb.in_pass &&
-                                    s_eb.open_rp_base == rp_base && s_eb.open_fb == fb &&
-                                    s_eb.open_w == w && s_eb.open_h == h &&
-                                    !vk_eb_draw_samples_open_rt();
+        const int same_fb = s_eb.in_pass &&
+                            s_eb.open_rp_base == rp_base && s_eb.open_fb == fb &&
+                            s_eb.open_w == w && s_eb.open_h == h;
+        const int self_read = (!clear_mask && same_fb) ? vk_eb_draw_samples_open_rt() : 0;
+        const int would_same_pass = !clear_mask && same_fb && !self_read;
         if (!would_same_pass) {
-            vk_eb_end_pass();
+            vk_eb_end_pass_reason(clear_mask ? VK_PB_CLR : (self_read ? VK_PB_SELF : VK_PB_FB));
             vk_eb_try_early_submit();
         }
     }
@@ -8651,7 +8731,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
             int reuse_vs = sl->has_last_vs && sl->last_vs_gen == s_e2.vs_gen &&
                            P->vp_const_lo >= sl->last_vs_lo &&
                            P->vp_const_hi <= sl->last_vs_hi;
-            if (!reuse_vs && sl->has_last_vs && vsrc &&
+            if (!reuse_vs && sl->has_last_vs && sl->last_vs_copy_valid && vsrc &&
                 vsb >= tail_off + 32u && vsb <= VK_VPCONST_BYTES &&
                 P->vp_const_lo >= sl->last_vs_lo && P->vp_const_hi <= sl->last_vs_hi &&
                 P->vp_const_hi <= RSX_MAX_VERTEX_CONSTANTS) {
@@ -8732,25 +8812,27 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
                     if (!reuse_vs) {
                         u8* vdst = (u8*)sl->ub.ptr + uvs;
                         if (vsb >= tail_off + 32u && P->vp_const_hi <= RSX_MAX_VERTEX_CONSTANTS) {
-                            if (P->vp_const_hi > P->vp_const_lo) {
-                                const u32 off_b = (u32)P->vp_const_lo * 16u;
-                                const u32 len_b = (u32)(P->vp_const_hi - P->vp_const_lo) * 16u;
+                            const u32 off_b = (u32)P->vp_const_lo * 16u;
+                            const u32 len_b = (P->vp_const_hi > P->vp_const_lo)
+                                                ? (u32)(P->vp_const_hi - P->vp_const_lo) * 16u : 0u;
+                            const int save_copy = (len_b <= 2048u && vsb <= VK_VPCONST_BYTES);
+                            if (len_b) {
                                 memcpy(vdst + off_b, vsrc + off_b, len_b);
-                                if (off_b + len_b <= VK_VPCONST_BYTES)
+                                if (save_copy && off_b + len_b <= VK_VPCONST_BYTES)
                                     memcpy(s_eb.last_vs_copy + off_b, vsrc + off_b, len_b);
                             }
                             /* Always copy vp_posscale + vp_posoffset tail (32 bytes). */
                             memcpy(vdst + tail_off, vsrc + tail_off, vsb - tail_off);
-                            if (vsb <= VK_VPCONST_BYTES)
+                            if (save_copy)
                                 memcpy(s_eb.last_vs_copy + tail_off, vsrc + tail_off, vsb - tail_off);
                             sl->last_vs_lo = P->vp_const_lo;
                             sl->last_vs_hi = P->vp_const_hi;
+                            sl->last_vs_copy_valid = save_copy;
                         } else {
                             memcpy(vdst, vsrc, vsb);
-                            if (vsb <= VK_VPCONST_BYTES)
-                                memcpy(s_eb.last_vs_copy, vsrc, vsb);
                             sl->last_vs_lo = 0;
                             sl->last_vs_hi = RSX_MAX_VERTEX_CONSTANTS;
+                            sl->last_vs_copy_valid = 0;
                         }
                         sl->has_last_vs = 1; sl->last_vs_gen = s_e2.vs_gen; sl->last_vs_off = uvs;
                     } else {
@@ -8785,12 +8867,13 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
             vbuf = sl->vb.buf; ibuf = sl->ib.buf;
         }
         if (!s_eb_pending && vk_begin()) return;
-        const int same_pass = !clear_mask && s_eb.in_pass &&
-                              s_eb.open_rp_base == rp_base && s_eb.open_fb == fb &&
-                              s_eb.open_w == w && s_eb.open_h == h &&
-                              !vk_eb_draw_samples_open_rt();
+        const int same_fb = s_eb.in_pass &&
+                            s_eb.open_rp_base == rp_base && s_eb.open_fb == fb &&
+                            s_eb.open_w == w && s_eb.open_h == h;
+        const int self_read = (!clear_mask && same_fb) ? vk_eb_draw_samples_open_rt() : 0;
+        const int same_pass = !clear_mask && same_fb && !self_read;
         if (!same_pass) {
-            vk_eb_end_pass();
+            vk_eb_end_pass_reason(clear_mask ? VK_PB_CLR : (self_read ? VK_PB_SELF : VK_PB_FB));
             /* Tighter graphics+transfer pass barrier (no ALL_COMMANDS stall or
              * redundant per-attachment GENERAL->GENERAL image barriers). */
             vk_cmd_pass_barrier(s_vk.cmd);
